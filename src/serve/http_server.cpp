@@ -84,6 +84,10 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
             current.committed_decode_tokens - previous.committed_decode_tokens,
         .decode_rounds     = current.decode_rounds - previous.decode_rounds,
         .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
+        .speculative_drafted_tokens =
+            current.speculative_drafted_tokens - previous.speculative_drafted_tokens,
+        .speculative_accepted_tokens =
+            current.speculative_accepted_tokens - previous.speculative_accepted_tokens,
         .scheduler         = current,
     };
 }
@@ -134,6 +138,9 @@ HttpServer::HttpServer(ServeOptions options)
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
+    // SSE sends headers and small token frames separately. Nagle can hold the first frame behind
+    // a delayed ACK on a reused connection, adding about 40 ms to TTFT.
+    server_.set_tcp_nodelay(true);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }
@@ -402,7 +409,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = outcome.usage();
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -487,7 +494,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                               include_usage));
                 }
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage = outcome.usage();
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
                 }
@@ -615,7 +622,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = outcome.usage();
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,
@@ -738,7 +745,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const char* stop_reason =
                     messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
                 write_stream_item(sink, *stream,
-                                  make_message_delta(stop_reason, outcome.completion_tokens));
+                                  make_message_delta(stop_reason, outcome.usage()));
                 write_stream_item(sink, *stream, make_message_stop());
                 sink.done();
                 return true;
