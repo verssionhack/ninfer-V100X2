@@ -950,7 +950,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (quasar && (tp != 2 && pp != 2)) {
         throw std::invalid_argument("QUASAR requires TP2 or text-only PP2 (DFlash is TP2 only)");
     }
-    if (features.volta_fast_decode && (!quasar || tp != 2 || pp != 1 || features.vision || features.dflash())) {
+    // Vision binds its own backbone through bind_vision_backbone and never uses the text/MTP
+    // projections whose NVFP4 epilogue and W8 packing this profile changes, so the combination
+    // is safe. The rest of the gate still applies.
+    if (features.volta_fast_decode && (!quasar || tp != 2 || pp != 1 || features.dflash())) {
         throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2 Text/None/MTP");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
