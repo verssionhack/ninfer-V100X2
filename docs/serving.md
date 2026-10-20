@@ -615,6 +615,7 @@ client-side override.
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, concurrency 1, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2/PP1 Text/None/MTP decode profile: packed NVFP4 FP32-scale epilogues and prepacked MTP W8 projections; may be combined with `--vision`; excludes DFlash; logits, drop acceptance and output IDs may change | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
