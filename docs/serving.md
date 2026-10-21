@@ -740,6 +740,17 @@ rounds is the effective fairness knob and trades prefill throughput for decoder 
 Both settings apply only when some lane is decode-ready; with no decoder present the full chunk is
 used and no decode rounds are inserted.
 
+Admission is FIFO and decides long versus short dynamically from the request's KV entitlement, not
+from a configured length. A head that fits beside the active lanes is admitted concurrently and
+keeps the sliced prefill. A head that does not fit becomes the *protected head*: short requests
+behind it may only backfill within the remaining temporal credit, then new admissions stop and the
+active lanes drain, so the head starts with the whole pool and uses whole prefill chunks even if a
+backfill is still decoding. This bounds the head's wait by the completion of the requests already
+in front of it and prevents a stream of short requests from starving it. The output budget of such
+a request is capped to the remaining context (`capacity - prompt + 1`), so raising
+`--max-context` to the KV pool size (262144 with `--kv-capacity 262144`) lets a long request use
+the full window while short requests keep sharing the pool concurrently.
+
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
 media request retains the same cancellation and timeout deadline. Model output is bounded by the

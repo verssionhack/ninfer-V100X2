@@ -370,6 +370,10 @@ private:
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
+        // True when this request was the protected head of the admission queue: it could not fit
+        // beside the active lanes, so the executor drained them and admitted it with the pool.
+        // Its prefill takes whole chunks instead of the decode-friendly slice.
+        bool exclusive_prefill = false;
         // Prompt tokens of this request made resident so far (reused prefix + prefill work), a
         // live progress readout for the runtime-stats snapshot while it owns the prefill lane.
         std::uint32_t prefill_processed_tokens = 0;
@@ -774,6 +778,13 @@ private:
     // short steps would just add launch overhead to the same work.
     [[nodiscard]] std::uint32_t prefill_step_tokens() const noexcept {
         if (prefill_slice_tokens_ == 0) { return 0; }
+        // The protected head runs the old whole-chunk prefill: slicing it would let a short
+        // backfill's decode monopolize the GPU between 256-token steps, which is exactly the
+        // starvation this path exists to avoid.
+        if (prefill_lane_ && slots_[*prefill_lane_] != nullptr &&
+            slots_[*prefill_lane_]->exclusive_prefill) {
+            return 0;
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr && slots_[lane]->decode_ready) {
                 return prefill_slice_tokens_;
@@ -941,6 +952,10 @@ private:
             }
             protection_->temporal_credit -= summary.service_work_quanta;
         }
+        // The protected head was admitted after the drain; it owns the pool and should prefill
+        // with whole chunks. A normal head or a backfill candidate keeps the concurrent path.
+        request->exclusive_prefill =
+            protection_ && protection_->head_request_id == request->id;
         clear_protection_if_head(request);
 
         const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
