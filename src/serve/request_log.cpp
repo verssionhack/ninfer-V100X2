@@ -638,6 +638,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                         static_cast<double>(report.decode_rounds);
     }
     record["interval_seconds"] = report.interval_seconds;
+    record["speculative"] = Json{{"drafted_tokens", report.speculative_drafted_tokens},
+                                  {"accepted_tokens", report.speculative_accepted_tokens}};
     record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
