@@ -879,11 +879,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         SequenceState& source = sequences[source_lane];
         const std::uint32_t frontier = request_plan.reuse_base;
-        if (!source.retained || !source.kv || frontier == 0 ||
-            frontier > source.text_kv_valid ||
+        // A retained or actively serving source is valid: its prefix pages up to `frontier` are
+        // immutable and the boundary's recurrent state is a host copy. Planning and this start
+        // run on the worker with no source step in between.
+        if (!source.kv || frontier == 0 || frontier > source.text_kv_valid ||
             !qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
                                              frontier)) {
-            throw std::logic_error("shared prefix source lane is no longer resident");
+            throw std::logic_error("shared prefix source lane is no longer available");
         }
         HostCheckpoint* pinned = nullptr;
         if (request_plan.share_slot == SharedPrefixSlot::Tools) {
