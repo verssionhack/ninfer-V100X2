@@ -868,12 +868,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
         // one, so the reuse branch below takes both, and the reported path stays truthful.
     }
-    // Cross-lane prefix sharing: materialize the shared prefix by reference into the empty target
+    // Cross-lane prefix sharing: materialize the shared prefix by reference into the target
     // lane. The source stays resident and untouched; the pool reference count keeps its pages
     // alive for both lanes, and copy-on-write splits the page where the branches diverge.
     if (request_plan.reuse == ReusePath::ShareLanePrefix) {
         const std::uint32_t source_lane = request_plan.share_lane;
-        if (sequence.kv) { throw std::logic_error("shared prefix requires an empty target lane"); }
         if (source_lane >= max_concurrency || source_lane == lane) {
             throw std::logic_error("shared prefix names an invalid source lane");
         }
@@ -886,6 +885,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             !qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
                                              frontier)) {
             throw std::logic_error("shared prefix source lane is no longer available");
+        }
+        // The plan may replace a retained occupant of the target lane (nothing resident matched,
+        // so the planner offered the share instead of a full reset). Park it by the same rule the
+        // full-reset path applies, so a conversation that comes back is restored rather than
+        // re-prefilled; a refused insert leaves the lane cleared, exactly as there.
+        if (sequence.kv) {
+            if (!sequence.retained || !park_retained_lane(sequence.lane)) {
+                clear_lane(sequence, requests[lane]);
+            }
+            if (sequence.kv) {
+                throw std::logic_error("shared prefix target lane is not empty");
+            }
         }
         HostCheckpoint* pinned = nullptr;
         if (request_plan.share_slot == SharedPrefixSlot::Tools) {
@@ -903,8 +914,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
             }
         } else {
-            for (HostCheckpoint& boundary : source.boundary_history) {
-                if (boundary.frontier == frontier) { pinned = &boundary; break; }
+            // SharedPrefixSlot::None names a checkpoint from the source's host ring, which keeps
+            // the stable boundary the pinned boundary list does not.
+            for (HostCheckpoint& checkpoint : source.checkpoint_history) {
+                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
+            }
+            if (pinned == nullptr) {
+                for (HostCheckpoint& boundary : source.boundary_history) {
+                    if (boundary.frontier == frontier) { pinned = &boundary; break; }
+                }
             }
         }
         if (pinned == nullptr || pinned->frontier != frontier ||

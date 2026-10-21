@@ -825,13 +825,17 @@ spill/read when the park budget is full) rather than a multi-thousand-token re-p
 `reuse_trace` emits `park_snapshot` for each such copy.
 
 With `--max-concurrency` above one, two resident lanes can also share the pages of a common prefix
-instead of copying or re-prefilling it. When a request arrives on an idle lane whose prompt matches
-a pinned boundary of another retained lane (the fork where two branches diverge), the planner
-borrows that lane's KV pages by reference: the physical pool reference-counts them, the owning lane
-is never evicted to admit the request, and the new lane copies on write only the page that contains
-the divergence point before appending its own suffix. The recurrent state and hidden at the fork
-come from the boundary checkpoint, so the suffix prefill starts from the exact shared state. The
-completion log reports `reuse=share_lane_prefix`.
+instead of copying or re-prefilling it. When a request's prompt matches a pinned boundary of another
+lane (the fork where two branches diverge), the planner borrows that lane's KV pages by reference:
+the physical pool reference-counts them, the owning lane is never evicted to admit the request, and
+the new lane copies on write only the page that contains the divergence point before appending its
+own suffix. The source may be an idle retained lane or one that is actively prefilling or decoding,
+since its pages up to the pinned boundary are immutable; the arriving request may also take the
+share on a lane whose own retained occupant it replaces, which is parked first exactly as a full
+reset parks it. A share must beat whatever the target lane already offers by at least 1,024 tokens,
+so a longer resident continuation or boundary always wins. The recurrent state and hidden at the
+fork come from the boundary checkpoint, so the suffix prefill starts from the exact shared state.
+The completion log reports `reuse=share_lane_prefix`.
 
 The gain is a larger effective per-request ceiling per lane. Without sharing, two lanes each need
 their whole prompt resident, so each is bounded by half the pool; with sharing they only need their
