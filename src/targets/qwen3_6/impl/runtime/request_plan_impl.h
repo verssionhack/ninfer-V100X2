@@ -434,8 +434,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 pinned.frontier > prompt.token_ids.size()) {
                 return;
             }
+            // The source may be retained or actively serving: its pages up to the pinned
+            // frontier are immutable, and the pinned boundary is a host copy. The worker
+            // serializes planning and start, so the source cannot change between them.
             const SequenceState& source = sequences[other];
-            if (!source.retained || !source.kv || pinned.frontier > source.text_kv_valid) { return; }
+            if (!source.kv || pinned.frontier > source.text_kv_valid) { return; }
             if (!qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
                                                  pinned.frontier)) {
                 return;
@@ -456,7 +459,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         for (std::uint32_t other = 0; other < max_concurrency; ++other) {
             if (other == lane) { continue; }
             const SequenceState& source = sequences[other];
-            if (!source.retained || !source.kv) { continue; }
+            if (!source.kv) { continue; }
             for (const HostCheckpoint& boundary : source.boundary_history) {
                 consider(other, boundary, SharedPrefixSlot::Message);
             }
