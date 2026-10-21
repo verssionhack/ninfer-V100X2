@@ -103,8 +103,13 @@ int main(int argc, char** argv) {
         service.warmup();
 
         g_server.store(&server);
+        // A terminal or tmux close sends SIGHUP. Treat it like an interactive stop so the
+        // shutdown dump can park retained lanes and persist RAM-parked conversations; the
+        // default action would kill the process without either.
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+        std::signal(SIGHUP, handle_signal);
+        std::signal(SIGQUIT, handle_signal);
 
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port
