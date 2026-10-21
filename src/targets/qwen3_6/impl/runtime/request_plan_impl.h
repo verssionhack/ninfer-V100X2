@@ -418,9 +418,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // the lane that arrives second borrows the pages of the prefix they share instead of
     // re-prefilling or copying it. Only pinned boundaries are offered (the point where branches
     // fork), and the borrowing lane copies on write at the divergence.
+    // The share competes with whatever the target lane already offers (a resident continuation
+    // or a retained boundary): the longer reuse wins, and a plan that replaces the lane's
+    // retained occupant parks it in start_prefill exactly as a full reset does.
     if (base.allow_prefix_reuse && prompt.identity.reusable &&
         speculative_backend != SpeculativeBackend::DFlash && ram_kv.gpu_tokens == 0 &&
-        max_concurrency > 1 && (!sequence.retained || !sequence.kv)) {
+        max_concurrency > 1) {
         const auto snapshot_pages = [](std::uint32_t tokens) -> std::uint32_t {
             return tokens == 0 ? 0U
                                : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -438,18 +441,33 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             // frontier are immutable, and the pinned boundary is a host copy. The worker
             // serializes planning and start, so the source cannot change between them.
             const SequenceState& source = sequences[other];
-            if (!source.kv || pinned.frontier > source.text_kv_valid) { return; }
+            if (!source.kv || pinned.frontier > source.text_kv_valid) {
+                reuse_trace("  share_cand source=%u frontier=%u slot=%d reject=extent "
+                            "text_kv=%u",
+                            other, pinned.frontier, static_cast<int>(slot), source.text_kv_valid);
+                return;
+            }
             if (!qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
                                                  pinned.frontier)) {
+                reuse_trace("  share_cand source=%u frontier=%u slot=%d reject=lane_prefix "
+                            "ledger=%zu identity=%zu",
+                            other, pinned.frontier, static_cast<int>(slot), source.ledger.size(),
+                            source.prefix_identity.size());
                 return;
             }
             const bool own = !pinned.ledger.empty();
             if (own && !qwen3_6::detail::prefix_matches(prompt, pinned.ledger, pinned.identity,
                                                         pinned.frontier)) {
+                reuse_trace("  share_cand source=%u frontier=%u slot=%d reject=own_prefix "
+                            "ledger=%zu identity=%zu",
+                            other, pinned.frontier, static_cast<int>(slot), pinned.ledger.size(),
+                            pinned.identity.size());
                 return;
             }
             if (speculative_backend == SpeculativeBackend::Mtp &&
                 source.mtp_kv_valid < pinned.frontier - 1) {
+                reuse_trace("  share_cand source=%u frontier=%u slot=%d reject=mtp mtp_kv=%u",
+                            other, pinned.frontier, static_cast<int>(slot), source.mtp_kv_valid);
                 return;
             }
             best_frontier = pinned.frontier;
@@ -460,6 +478,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             if (other == lane) { continue; }
             const SequenceState& source = sequences[other];
             if (!source.kv) { continue; }
+            reuse_trace("  share_source lane=%u text_kv=%u mtp_kv=%u boundaries=%zu responses=%zu "
+                        "long_range=%zu checkpoints=%zu",
+                        other, source.text_kv_valid, source.mtp_kv_valid,
+                        source.boundary_history.size(), source.response_history.size(),
+                        source.long_range_history.size(), source.checkpoint_history.size());
             for (const HostCheckpoint& boundary : source.boundary_history) {
                 consider(other, boundary, SharedPrefixSlot::Message);
             }
@@ -469,13 +492,28 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             for (const HostCheckpoint& checkpoint : source.long_range_history) {
                 consider(other, checkpoint, SharedPrefixSlot::LongRange);
             }
+            // The host ring also mirrors the last stable message boundary, which never enters
+            // the pinned boundary list; it is the fork point of the most common branch rewrite.
+            for (const HostCheckpoint& checkpoint : source.checkpoint_history) {
+                consider(other, checkpoint, SharedPrefixSlot::None);
+            }
             consider(other, source.resume_anchor, SharedPrefixSlot::Anchor);
             consider(other, source.shared_prefix, SharedPrefixSlot::Leading);
             consider(other, source.tools_prefix, SharedPrefixSlot::Tools);
         }
-        if (best_frontier >= 2048) {
+        // Taking the share replaces the lane's incumbent, so it must beat what the resident plan
+        // already offers; a few thousand extra tokens do not pay for parking a retained occupant.
+        constexpr std::uint32_t kMinimumShareTokens = 2048;
+        constexpr std::uint32_t kMinimumShareGain   = 1024;
+        const bool share_wins =
+            best_frontier >= kMinimumShareTokens &&
+            (plan->reuse == ReusePath::FullReset ||
+             best_frontier >= plan->reuse_base + kMinimumShareGain);
+        if (share_wins) {
             plan->reuse                   = ReusePath::ShareLanePrefix;
             plan->reuse_base              = best_frontier;
+            plan->checkpoint_index        = 0;
+            plan->restore_shared_prefix   = SharedPrefixSlot::None;
             plan->share_lane              = best_lane;
             plan->share_slot              = best_slot;
             plan->shared_text_kv_pages = snapshot_pages(best_frontier);
@@ -796,7 +834,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // validated against the pre-restore checkpoint would fail (or retain the wrong state).
     const bool existing_checkpoint_matches =
         desired && plan->reuse != ReusePath::FullReset &&
-        plan->reuse != ReusePath::RestoreParkedKv && plan->checkpoint_index == 0 &&
+        plan->reuse != ReusePath::RestoreParkedKv &&
+        plan->reuse != ReusePath::ShareLanePrefix && plan->checkpoint_index == 0 &&
         sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
