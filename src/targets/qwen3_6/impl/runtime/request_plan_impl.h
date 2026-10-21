@@ -648,10 +648,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
+        // The source may be retained or actively serving; either way its MTP plane must cover
+        // the borrowed frontier.
         const bool share_ready =
             plan->reuse == ReusePath::ShareLanePrefix && decoder->mtp_cache() != nullptr &&
             plan->reuse_base != 0 && plan->share_lane < max_concurrency &&
-            sequences[plan->share_lane].retained && sequences[plan->share_lane].kv &&
+            sequences[plan->share_lane].kv &&
             sequences[plan->share_lane].mtp_kv_valid >= plan->reuse_base - 1;
         bool checkpoint_fallback = false;
         if (plan->reuse == ReusePath::AppendAtFrontier && !append_ready &&
