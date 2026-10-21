@@ -119,6 +119,7 @@ struct MtpDecodeStateLayout {
     TensorRegion alignment_ids;
     TensorRegion alignment_hidden;
     TensorRegion ar_hidden;
+    TensorRegion next_hidden;
     TensorRegion ar_positions;
     TensorRegion ar_rope_positions;
     TensorRegion ar_valid_columns;
@@ -229,6 +230,7 @@ struct MtpDecodeState {
     Tensor alignment_ids;
     Tensor alignment_hidden;
     Tensor ar_hidden;
+    Tensor next_hidden;
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;

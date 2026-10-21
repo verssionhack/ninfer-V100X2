@@ -50,11 +50,6 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
-
-    [[nodiscard]] CompletionUsage usage() const {
-        return {prompt_tokens, completion_tokens,
-                static_cast<int>(metrics.prefix_cache_hit_tokens)};
-    }
 };
 
 struct StreamSink {

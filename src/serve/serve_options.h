@@ -72,7 +72,6 @@ struct ServeOptions {
     std::uint32_t kv_park_prefetch     = 0;
     std::uint64_t kv_park_max_age_sec  = 0;
     bool volta_long_attention = false;
-    bool volta_fast_decode = false;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     VisionDevice vision_device = VisionDevice::Gpu;

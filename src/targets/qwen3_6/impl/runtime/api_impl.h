@@ -224,7 +224,7 @@ GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) 
 }
 
 template <>
-const SpeculativeStats& Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
+SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
     return impl_->speculative_stats_lane(lane);
 }
 

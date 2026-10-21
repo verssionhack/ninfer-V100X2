@@ -10,8 +10,6 @@ struct StartupFeatures {
     bool vision_cpu                = false;
     // GPU Vision scratch is demand-allocated per image; startup reserves none.
     bool vision_kv_swap            = false;
-    // QUASAR SM70 TP2 Text/None/MTP: packed NVFP4 FP32 epilogues and MTP W8 reductions.
-    bool volta_fast_decode         = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
     ProposalHead proposal_head     = ProposalHead::Full;
 
@@ -32,13 +30,12 @@ struct StartupFeatures {
 
 [[nodiscard]] inline StartupFeatures startup_features(const EngineOptions& options) noexcept {
     return StartupFeatures{
-        .vision            = options.enable_vision,
-        .vision_cpu        = options.enable_vision && options.vision_device == VisionDevice::Cpu,
-        .vision_kv_swap    = options.enable_vision &&
+        .vision         = options.enable_vision,
+        .vision_cpu     = options.enable_vision && options.vision_device == VisionDevice::Cpu,
+        .vision_kv_swap = options.enable_vision &&
                           options.vision_device == VisionDevice::Gpu && options.vision_kv_swap,
-        .volta_fast_decode = options.volta_fast_decode,
-        .speculative       = options.speculative.backend,
-        .proposal_head     = options.speculative.proposal_head,
+        .speculative    = options.speculative.backend,
+        .proposal_head  = options.speculative.proposal_head,
     };
 }
 

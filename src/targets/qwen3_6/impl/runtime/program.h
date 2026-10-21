@@ -398,8 +398,7 @@ public:
     [[nodiscard]] bool park_retained_lane(std::uint32_t lane, std::uint64_t protect_id = 0,
                                           bool detach = true) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] const SpeculativeStats&
-    speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 

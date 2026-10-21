@@ -2865,10 +2865,8 @@ GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) c
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
 }
 
-const SpeculativeStats&
-ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    static const SpeculativeStats empty{};
-    return lane < max_concurrency ? requests[lane].speculative_stats : empty;
+SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {

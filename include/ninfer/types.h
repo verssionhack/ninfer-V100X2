@@ -162,9 +162,6 @@ struct EngineOptions {
     // Complete-history SM70 TP2 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
-    // QUASAR SM70 TP2 Text/None/MTP: packed NVFP4 FP32 epilogues and MTP W8 reductions.
-    // Changes arithmetic; independent of the optional complete-history attention profile.
-    bool volta_fast_decode             = false;
     RamKvOptions ram_kv;
     // Host budget, in bytes, for parked conversations. Zero (the default) disables parking: a
     // finished conversation's KV stays resident for prefix reuse and is dropped the moment another
@@ -642,9 +639,6 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;
-    // Draft proposals and target-accepted drafts; bonus tokens are not accepted drafts.
-    std::uint64_t speculative_drafted_tokens  = 0;
-    std::uint64_t speculative_accepted_tokens = 0;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;

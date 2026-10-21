@@ -15,13 +15,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-Json completion_usage_json(const CompletionUsage& usage) {
-    return Json{{"input_tokens", usage.prompt_tokens - usage.cached_tokens},
-                {"output_tokens", usage.completion_tokens},
-                {"cache_read_input_tokens", usage.cached_tokens},
-                {"cache_creation_input_tokens", 0}};
-}
-
 constexpr std::size_t kMaxToolNameLength = 128;
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
@@ -599,7 +592,8 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                           {"content", std::move(blocks)},
                           {"stop_reason", stop_reason},
                           {"stop_sequence", nullptr},
-                          {"usage", completion_usage_json(usage)}};
+                          {"usage", Json{{"input_tokens", usage.prompt_tokens},
+                                         {"output_tokens", usage.completion_tokens}}}};
     return payload.dump();
 }
 
@@ -663,11 +657,11 @@ std::string make_content_block_stop(int index) {
     return sse("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}});
 }
 
-std::string make_message_delta(const char* stop_reason, const CompletionUsage& usage) {
+std::string make_message_delta(const char* stop_reason, int output_tokens) {
     return sse("message_delta",
                Json{{"type", "message_delta"},
                     {"delta", Json{{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-                    {"usage", completion_usage_json(usage)}});
+                    {"usage", Json{{"output_tokens", output_tokens}}}});
 }
 
 std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }

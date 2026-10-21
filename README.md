@@ -201,11 +201,7 @@ reuse and parking:
 ```
 
 Optionally add `--vision --vision-kv-swap --vision-max-tokens unlimited` and
-`--stream-keepalive-ms 15000`. On a QUASAR TP2 text/MTP profile,
-`--volta-fast-decode` enables packed NVFP4 FP32-scale epilogues and prepacked MTP W8
-projections; it is independent of Vision and may be combined with it, and it changes logits and
-draft acceptance. A local MTP3 measurement moved decode from 118.9 to 133.1 tok/s (+12%).
-See [What's new](#whats-new-2026-10-15-to-2026-10-20) and
+`--stream-keepalive-ms 15000`. See [What's new](#whats-new-2026-10-15-to-2026-10-20) and
 [serving](docs/serving.md) for what each option does.
 For CLI use `build-v100/apps/ninfer` with the same inference flags and `--prompt TEXT --max-new N`.
 Installed GPU count does not fix runtime width: `--tp 2 --devices 4,6` selects a pair on an

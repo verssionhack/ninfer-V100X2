@@ -150,8 +150,6 @@ std::string serve_usage_text(const char* argv0) {
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --volta-long-attention: experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ\n"
-           "       --volta-fast-decode: experimental QUASAR TP2 NVFP4 FP32 epilogues and packed MTP W8;\n"
-           "       may be combined with --vision; output may differ.\n"
            "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; one SM70 27B Text/MTP request, TP1/TP2/PP2\n"
            "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
            "       --kv-park-bytes moves a replaced conversation's KV to host memory instead of dropping it,\n"
@@ -282,8 +280,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
-        } else if (arg == "--volta-fast-decode") {
-            options.volta_fast_decode = true;
         } else if (arg == "--volta-long-attention") {
             options.volta_long_attention = true;
         } else if (arg == "--ram-kv-window") {

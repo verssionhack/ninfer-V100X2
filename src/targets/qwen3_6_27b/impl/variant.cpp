@@ -9,7 +9,6 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
@@ -781,10 +780,9 @@ void Variant::attention_output_projection(std::span<const Tensor> attention,
                                           std::span<const Tensor> residual,
                                           std::span<const Tensor> staging, qwen3_6::TextPhase,
                                           std::span<WorkspaceArena* const> workspace,
-                                          const ExecutionContext& ec, const ops::PeerEvents& ev,
-                                    const ops::ReplicatedRmsNorm* norm) {
+                                          const ExecutionContext& ec, const ops::PeerEvents& ev) {
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
-                                 workspace, ec, ev, norm);
+                                 workspace, ec, ev);
 }
 
 void Variant::gdn_input_projection(std::span<const Tensor> hidden,
@@ -848,19 +846,13 @@ void Variant::gdn_output_projection(std::span<const Tensor> hidden,
                                     std::span<const Tensor> residual,
                                     std::span<const Tensor> staging, qwen3_6::TextPhase,
                                     std::span<WorkspaceArena* const> workspace,
-                                    const ExecutionContext& ec, const ops::PeerEvents& ev,
-                                    const ops::ReplicatedRmsNorm* norm) {
+                                    const ExecutionContext& ec, const ops::PeerEvents& ev) {
     if (weight[0].qtype == QType::GGML_K) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
-        if (norm != nullptr) for_each_rank(ec, [&](int rank) {
-            Tensor normalized = norm->output[rank];
-            ops::rmsnorm(residual[rank], norm->weight[rank], norm->eps, norm->unit_offset,
-                         normalized, ec.dev[rank]->stream);
-        });
         return;
     }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),
-                                 workspace, ec, ev, norm);
+                                 workspace, ec, ev);
 }
 
 void Variant::gdn_control_projection(std::span<const Tensor> hidden,
@@ -898,8 +890,7 @@ void Variant::post_mixer(std::span<const Tensor> hidden,
                          std::span<const Tensor> residual,
                          std::span<const Tensor> staging, qwen3_6::TextPhase,
                          std::span<WorkspaceArena* const> workspace,
-                         const ExecutionContext& ec, const ops::PeerEvents& ev,
-                         const ops::ReplicatedRmsNorm* norm) {
+                         const ExecutionContext& ec, const ops::PeerEvents& ev) {
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
@@ -917,7 +908,7 @@ void Variant::post_mixer(std::span<const Tensor> hidden,
     ops::linear_swiglu_column_parallel(hidden, active(weight_shards(w, &PostMixerWeights::gate_up, ec), ec), active(activation, ec),
                                        text_policy(w[0]->gate_up), workspace, ec);
     ops::linear_add_row_parallel(active(activation, ec), active(weight_shards(w, &PostMixerWeights::down, ec), ec), residual, staging,
-                                 text_policy(w[0]->down), workspace, ec, ev, norm);
+                                 text_policy(w[0]->down), workspace, ec, ev);
 }
 
 void Variant::gdn_input_projection_record(
