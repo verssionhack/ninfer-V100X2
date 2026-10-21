@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <memory>
 #include <vector>
@@ -249,7 +250,10 @@ public:
                                                              cudaStream_t stream = nullptr) const;
     // Restores a detached image into this allocation, which must be freshly reserved in the
     // image's own pool with at least image.pages() of entitlement and no mapped pages yet.
-    void attach_from_host(const PagedKVImage& image, cudaStream_t stream = nullptr);
+    // `pages` attaches only that prefix of the image; a parked entry may hold pages past the
+    // resume checkpoint (the previous turn's generated tokens), and only the prefix is needed.
+    void attach_from_host(const PagedKVImage& image, cudaStream_t stream = nullptr,
+                          std::uint32_t pages = std::numeric_limits<std::uint32_t>::max());
 
     void release() noexcept;
     // Ranking is storage-policy input supplied by the model family, not interpreted by core.

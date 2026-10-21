@@ -889,7 +889,8 @@ std::unique_ptr<PagedKVImage> PagedKVAllocation::copy_to_host(std::uint32_t page
     return image;
 }
 
-void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t stream) {
+void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t stream,
+                                         std::uint32_t pages) {
     if (!valid() || !image.valid()) {
         throw std::invalid_argument("Paged KV attach requires a live allocation and image");
     }
@@ -899,7 +900,8 @@ void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t
     if (mapped_page_count() != 0) {
         throw std::logic_error("Paged KV attach requires an allocation with no mapped pages");
     }
-    if (image.pages_ > page_entitlement_) {
+    const std::uint32_t count = std::min(image.pages_, pages);
+    if (count == 0 || count > page_entitlement_) {
         throw std::invalid_argument("Paged KV image exceeds the allocation entitlement");
     }
     if (image.plane_page_bytes_.size() != pool_->plane_count()) {
@@ -911,13 +913,13 @@ void PagedKVAllocation::attach_from_host(const PagedKVImage& image, cudaStream_t
         }
     }
 
-    materialize_pages(image.pages_, stream);
+    materialize_pages(count, stream);
     for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
         const Tensor& plane          = pool_->plane(p);
         const std::size_t page_bytes = image.plane_page_bytes_[p];
         const unsigned char* host    = image.data_.data() + image.plane_offsets_[p];
         copy_page_runs(
-            image.pages_, page_ids_, page_bytes, host,
+            count, page_ids_, page_bytes, host,
             static_cast<unsigned char*>(plane.data),
             [&](const unsigned char* src, unsigned char* dst, std::size_t bytes) {
                 copy_from_host_staged(dst, src, bytes, stream);

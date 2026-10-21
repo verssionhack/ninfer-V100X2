@@ -518,7 +518,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // worker's execution unit and fail the whole engine, so decline it here and let the
         // request prefill from its own prefix instead.
         // A disk-backed entry keeps only page COUNTS in RAM; a materialized one has the images.
-        const auto parked_images_fit = [&](const qwen3_6::detail::ParkedSequence& entry) {
+        // The image may be longer than the resume point: a parked entry includes the previous
+        // turn's generated tokens, while a checkpoint resume only needs the prefix. Compare the
+        // resume frontier's page count with the request entitlement and let the restore attach
+        // that prefix; a short image is unusable.
+        const auto parked_images_fit = [&](const qwen3_6::detail::ParkedSequence& entry,
+                                           std::uint32_t frontier) {
             // A disk-backed entry is only usable while its file exists; a deleted or manually
             // removed image must fall back to a normal prefill instead of failing at restore.
             if (entry.disk_backed) {
@@ -530,20 +535,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                 if (rank < images.size() && images[rank] != nullptr) { return images[rank]->pages(); }
                 return rank < disk.size() ? disk[rank] : 0U;
             };
-            const std::size_t ranks =
-                std::max(entry.text.size(), entry.text_pages.size());
+            const std::uint32_t required = pages_for_tokens(frontier);
+            if (required > plan->text_kv_page_entitlement) { return false; }
+            const std::size_t ranks = std::max(entry.text.size(), entry.text_pages.size());
+            if (ranks == 0) { return false; }
             for (std::size_t rank = 0; rank < ranks; ++rank) {
-                if (pages_at(entry.text, entry.text_pages, rank) >
-                    plan->text_kv_page_entitlement) {
-                    return false;
-                }
+                if (pages_at(entry.text, entry.text_pages, rank) < required) { return false; }
             }
-            const std::size_t backend_ranks =
-                std::max(entry.backend.size(), entry.backend_pages.size());
-            for (std::size_t rank = 0; rank < backend_ranks; ++rank) {
-                if (pages_at(entry.backend, entry.backend_pages, rank) >
-                    plan->backend_kv_page_entitlement) {
-                    return false;
+            if (plan->backend_kv_page_entitlement != 0) {
+                if (required > plan->backend_kv_page_entitlement) { return false; }
+                const std::size_t backend_ranks =
+                    std::max(entry.backend.size(), entry.backend_pages.size());
+                if (backend_ranks == 0) { return false; }
+                for (std::size_t rank = 0; rank < backend_ranks; ++rank) {
+                    if (pages_at(entry.backend, entry.backend_pages, rank) < required) {
+                        return false;
+                    }
                 }
             }
             return true;
@@ -551,13 +558,13 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool exact_usable = exact_entry != nullptr &&
                                   (speculative_backend != SpeculativeBackend::Mtp ||
                                    exact_entry->tail_hidden_valid) &&
-                                  parked_images_fit(*exact_entry);
+                                  parked_images_fit(*exact_entry, exact_entry->execution_frontier);
         const bool checkpoint_usable =
             checkpoint_match.has_value() &&
             (speculative_backend != SpeculativeBackend::Mtp ||
              (decoder->mtp_cache() != nullptr &&
               checkpoint_match->entry->mtp_kv_valid >= checkpoint_match->frontier - 1)) &&
-            parked_images_fit(*checkpoint_match->entry);
+            parked_images_fit(*checkpoint_match->entry, checkpoint_match->frontier);
         // The longer parked candidate: a checkpoint resume costs only the suffix prefill an
         // exact resume pays anyway, so an entry whose tail hidden was invalidated (a
         // cancellation during a speculative round) is still useful at its checkpoint frontier.

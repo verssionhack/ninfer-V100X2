@@ -3464,9 +3464,11 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
     // Reserve first: a restore that cannot fit must leave the lane empty rather than half-built.
     reserve_sequence_kv(sequence, text_pages, backend_pages);
     try {
-        sequence.kv->text.attach_from_host(*entry.text[0], device.stream);
+        const std::uint32_t prefix_pages = pages_for_snapshot(resume_frontier);
+        sequence.kv->text.attach_from_host(*entry.text[0], device.stream, prefix_pages);
         if (sequence.kv->backend) {
-            sequence.kv->backend->attach_from_host(*entry.backend[0], device.stream);
+            sequence.kv->backend->attach_from_host(*entry.backend[0], device.stream,
+                                                   prefix_pages);
         }
         // Resuming at a checkpoint materializes the checkpoint state into both slots below, so
         // importing the execution-frontier slot here would be overwritten unused.
@@ -3490,11 +3492,11 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
         }
         for (auto& peer : peers) {
             const ScopedDevice scope(peer->device.device);
-            sequence.kv->text_peers[peer->rank - 1]->attach_from_host(*entry.text[peer->rank],
-                                                                      peer->device.stream);
+            sequence.kv->text_peers[peer->rank - 1]->attach_from_host(
+                *entry.text[peer->rank], peer->device.stream, prefix_pages);
             if (sequence.kv->backend_peers[peer->rank - 1]) {
                 sequence.kv->backend_peers[peer->rank - 1]->attach_from_host(
-                    *entry.backend[peer->rank], peer->device.stream);
+                    *entry.backend[peer->rank], peer->device.stream, prefix_pages);
             }
             if (!resumes_at_boundary) {
                 import_slot_staged(
