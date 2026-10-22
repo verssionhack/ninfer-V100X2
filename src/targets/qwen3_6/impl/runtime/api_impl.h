@@ -153,6 +153,41 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
+Program<Variant>::ParkedRestoreGate
+Program<Variant>::gate_parked_restore(const RequestPlan<Variant>& plan) {
+    using ImplGate = detail::NINFER_QWEN36_RUNTIME_NS::ProgramImplCore::ParkedRestoreGate;
+    switch (impl_->gate_parked_restore(plan)) {
+    case ImplGate::Proceed: return ParkedRestoreGate::Proceed;
+    case ImplGate::Loading: return ParkedRestoreGate::Loading;
+    case ImplGate::Unavailable: return ParkedRestoreGate::Unavailable;
+    }
+    return ParkedRestoreGate::Loading;
+}
+
+template <>
+Program<Variant>::ParkedRestoreGate
+Program<Variant>::gate_share_source(const RequestPlan<Variant>& plan,
+                                    const PreparedPrompt& prompt) {
+    using ImplGate = detail::NINFER_QWEN36_RUNTIME_NS::ProgramImplCore::ParkedRestoreGate;
+    switch (impl_->gate_share_source(plan, PreparedPromptAccess::view(prompt))) {
+    case ImplGate::Proceed: return ParkedRestoreGate::Proceed;
+    case ImplGate::Loading: return ParkedRestoreGate::Loading;
+    case ImplGate::Unavailable: return ParkedRestoreGate::Unavailable;
+    }
+    return ParkedRestoreGate::Loading;
+}
+
+template <>
+void Program<Variant>::pump_parked_io() {
+    impl_->pump_parked_io();
+}
+
+template <>
+bool Program<Variant>::parked_io_pending() const noexcept {
+    return impl_->parked_io_pending();
+}
+
+template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,

@@ -156,6 +156,19 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // Disk-backed parked restores load on a background reader so a multi-gigabyte image does not
+    // stop the engine. `Loading` keeps the request queued (other lanes keep serving),
+    // `Unavailable` asks the caller to re-plan against the remaining state, `Proceed` means the
+    // image is in hand and the lane can start.
+    enum class ParkedRestoreGate : std::uint8_t { Proceed, Loading, Unavailable };
+    [[nodiscard]] ParkedRestoreGate gate_parked_restore(const RequestPlan<Variant>& plan);
+    // A cross-lane share plan names another lane's state, which keeps changing while this request
+    // waits. Re-validate the source immediately before start; `Unavailable` re-plans the request.
+    [[nodiscard]] ParkedRestoreGate gate_share_source(const RequestPlan<Variant>& plan,
+                                                      const PreparedPrompt& prompt);
+    // Worker tick: moves finished background spills and image loads into the parked index/cache.
+    void pump_parked_io();
+    [[nodiscard]] bool parked_io_pending() const noexcept;
     // `max_tokens` bounds one step below the configured prefill chunk; zero uses the full chunk.
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,

@@ -630,7 +630,7 @@ client-side override.
 | `--shared-prefix-dir DIR` | persist one image per distinct shared prefix (different system prompts/tool sets) and load every image in the directory at startup | unset |
 | `--kv-park-spill-dir DIR` | spill least-recently-used parked conversations to DIR when the host parking budget is exhausted | unset |
 | `--kv-park-spill-bytes N` | disk budget for spilled conversations; `0` uses `--kv-park-bytes` | `0` |
-| `--kv-park-io-bytes N` | payload bytes queued to the background spill writer; `0` = synchronous | `8 GiB` |
+| `--kv-park-io-bytes N` | payload bytes queued to the background spill writer and restore reader; `0` = synchronous | `8 GiB` |
 | `--kv-park-prefetch N` | startup MRU prefetch of spilled conversations into RAM | `0` |
 | `--kv-park-max-age-sec N` | delete spill images idle longer than N seconds; `0` disables | `0` |
 | `--vision-max-tokens N\|unlimited` | merged visual-token limit per prompt and its device reservations; `unlimited`/`none`/`0` removes the limit (needs `--vision-kv-swap` or `--vision-device cpu`) | `32768` |
@@ -836,6 +836,16 @@ so a longer resident continuation or boundary always wins. The recurrent state a
 fork come from the boundary checkpoint, so the suffix prefill starts from the exact shared state.
 The completion log reports `reuse=share_lane_prefix`.
 
+A parked image wins the tie against a share. Borrowing is a live-lane dependency: its pages stay
+valid only while the source lane keeps them, and taking it parks the target lane's occupant. When
+a usable parked or pinned-prefix entry covers the same prefix within the share's own 1,024-token
+gain, the planner restores the parked image instead, so a static leading block is resumed from its
+disk image rather than borrowed from an unrelated conversation. `reuse_trace` emits
+`parked_over_share` for that decision; the summary line's `exact_frontier` names the disk entry's
+frontier. Every `reuse_trace` line ending in `plan_candidate` describes one lane's option, not the
+executed choice -- the executor plans each idle lane and starts the request on exactly one, which
+the subsequent `start_prefill lane=...` line names.
+
 The gain is a larger effective per-request ceiling per lane. Without sharing, two lanes each need
 their whole prompt resident, so each is bounded by half the pool; with sharing they only need their
 own suffixes plus one copy of the common prefix -- `2 * ceiling - prefix <= pool`. For a 262,144-token
@@ -870,16 +880,22 @@ line, and duplicate states of one lineage are reduced to the newest copy. Choose
 room for the budget; a 175k-token conversation is roughly 7 GiB. Files can be deleted while the
 server is stopped; the sidecar and image are removed together.
 
-Disk I/O runs on one deterministic FIFO writer, so a multi-GB spill never blocks the serving
-worker and spill order does not depend on request timing. `--kv-park-io-bytes N` bounds the
-payload bytes submitted to that writer (`0` restores synchronous writes on the worker), and the
-worker drains completed images at the next planning or spill step. Restores still run on the
-worker; `--kv-park-prefetch N` reads the N most recently written spill images back into host RAM
-at startup in fixed MRU order, so a restart's first request avoids both the disk read and the
-initial prefill. Reads use sequential page-cache read-ahead. `--kv-park-max-age-sec N` deletes
-spill images idle longer than N seconds (file mtime), independent of the byte budget; the budget
-still evicts least-recently-used entries when exceeded. Pinned shared-prefix images are never
-prefetched or age-deleted.
+Disk I/O runs on two deterministic FIFOs: a writer for spills and a separate reader for restores,
+so neither a multi-GB spill nor a multi-GB load blocks the serving worker, and spill order does not
+depend on request timing. `--kv-park-io-bytes N` bounds the payload bytes submitted to them (`0`
+restores synchronous I/O on the worker), and the worker drains completed images at the start of
+each scheduler tick. A disk-backed restore is admitted only once its image is in hand: the request
+waits in the admission queue while the other lanes keep decoding, and the time spent loading is
+excluded from `--pending-timeout-ms`. A loaded image is cached until its lane starts; at least one
+image is always allowed, and further cached images are bounded by the I/O budget. An in-flight
+image is pinned against the age sweep and the byte-budget LRU, and a load failure drops a
+non-pinned entry (or just remembers a pinned one) instead of failing the engine. Shutdown joins
+the reader and can wait for one image load. `--kv-park-prefetch N` reads the N most recently
+written spill images back into host RAM at startup in fixed MRU order, so a restart's first request
+avoids both the disk read and the initial prefill. Reads use sequential page-cache read-ahead.
+`--kv-park-max-age-sec N` deletes spill images idle longer than N seconds (file mtime), independent
+of the byte budget; the budget still evicts least-recently-used entries when exceeded. Pinned
+shared-prefix images are never prefetched or age-deleted.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

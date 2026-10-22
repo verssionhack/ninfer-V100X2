@@ -522,6 +522,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (!park_spill_dir.empty() && kv_park_io_bytes != 0) {
         disk_io = std::make_unique<ParkedDiskIo>(image_geometry(), kv_park_io_bytes);
     }
+    // Restores load on their own reader so a multi-gigabyte image does not stop the worker. Pinned
+    // shared-prefix images are disk entries too, so the reader does not require a spill directory.
+    if (kv_park_io_bytes != 0) {
+        disk_read_io = std::make_unique<ParkedDiskReader>(kv_park_io_bytes);
+    }
     disk_index_loading_ = true;
     load_parked_spill_entries();
     disk_index_loading_ = false;
@@ -535,6 +540,10 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     // Finish queued spill images before the index and the CUDA state go away. The writer thread
     // captures only its own shared state, but shutdown is still the natural barrier: a graceful
     // restart must find complete images and sidecars.
+    // The reader is host-only, but it holds pool pointers captured at submit time; join it before
+    // the pools (and the Program) are destroyed. A load already running is not interruptible, so
+    // shutdown may wait for at most one image read.
+    if (disk_read_io) { disk_read_io->stop(); }
     if (disk_io) { disk_io->stop(); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     for (auto& peer : peers) {
@@ -848,12 +857,31 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             // Publish finished spill writes BEFORE binding `meta` to an index entry: draining can
             // evict or prune entries, which would leave a reference taken earlier dangling.
             drain_disk_completions();
-            const ParkedSequence* meta = find_disk_entry(target);
-            if (meta == nullptr) {
-                throw std::logic_error("planned disk-backed conversation is no longer stored");
+            std::unique_ptr<ParkedSequence> loaded = take_parked_image(target);
+            if (loaded != nullptr) {
+                // The admission gate guaranteed this image. The index entry may already be gone
+                // (an evictor released it while the load ran); then its charge was already
+                // returned and only the payload in hand remains.
+                loaded->id = target;
+                restore_parked_lane(sequence, *loaded, request_plan.text_kv_page_entitlement,
+                                    request_plan.backend_kv_page_entitlement,
+                                    request_plan.parked_checkpoint, request_plan.checkpoint_index,
+                                    request_plan.restore_shared_prefix, request_plan.reuse_base);
+                const ParkedSequence* meta = find_disk_entry(target);
+                if (meta != nullptr) { release_disk_entry_charged(*meta); }
+            } else {
+                // Defensive only: a ready image cannot disappear between the gate and this start
+                // (same worker, same lock). Fall back to the synchronous read rather than failing
+                // a lane that the plan still names.
+                const ParkedSequence* meta = find_disk_entry(target);
+                if (meta == nullptr) {
+                    throw std::logic_error("planned disk-backed conversation is no longer stored");
+                }
+                reuse_trace("park_restore_fallback lane=%u id=%llu", lane,
+                            static_cast<unsigned long long>(target));
+                restore_disk_entry(sequence, *meta, request_plan.text_kv_page_entitlement,
+                                   request_plan.backend_kv_page_entitlement, request_plan);
             }
-            restore_disk_entry(sequence, *meta, request_plan.text_kv_page_entitlement,
-                               request_plan.backend_kv_page_entitlement, request_plan);
         } else {
             parked_entry = parked.find_by_id(target);
             if (parked_entry == nullptr) {
@@ -898,33 +926,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 throw std::logic_error("shared prefix target lane is not empty");
             }
         }
-        HostCheckpoint* pinned = nullptr;
-        if (request_plan.share_slot == SharedPrefixSlot::Tools) {
-            pinned = &source.tools_prefix;
-        } else if (request_plan.share_slot == SharedPrefixSlot::Leading) {
-            pinned = &source.shared_prefix;
-        } else if (request_plan.share_slot == SharedPrefixSlot::Anchor) {
-            pinned = &source.resume_anchor;
-        } else if (request_plan.share_slot == SharedPrefixSlot::Response) {
-            for (HostCheckpoint& checkpoint : source.response_history) {
-                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
-            }
-        } else if (request_plan.share_slot == SharedPrefixSlot::LongRange) {
-            for (HostCheckpoint& checkpoint : source.long_range_history) {
-                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
-            }
-        } else {
-            // SharedPrefixSlot::None names a checkpoint from the source's host ring, which keeps
-            // the stable boundary the pinned boundary list does not.
-            for (HostCheckpoint& checkpoint : source.checkpoint_history) {
-                if (checkpoint.frontier == frontier) { pinned = &checkpoint; break; }
-            }
-            if (pinned == nullptr) {
-                for (HostCheckpoint& boundary : source.boundary_history) {
-                    if (boundary.frontier == frontier) { pinned = &boundary; break; }
-                }
-            }
-        }
+        const HostCheckpoint* pinned =
+            shared_pinned_checkpoint(source, request_plan.share_slot, frontier);
         if (pinned == nullptr || pinned->frontier != frontier ||
             pinned->state.size() != static_cast<std::size_t>(device_count) ||
             pinned->hidden.size() != static_cast<std::size_t>(
@@ -2118,6 +2121,14 @@ void ProgramImplCore::enforce_prefix_dir_cap() {
     const std::size_t remove_count = files.size() - kSharedPrefixDirFiles;
     for (std::size_t i = 0; i < remove_count; ++i) {
         const std::string removed = files[i].path.string();
+        bool loading              = false;
+        for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+            if (entry->disk_path == removed && parked_read_pins_.count(entry->id) != 0) {
+                loading = true;
+                break;
+            }
+        }
+        if (loading) { continue; }
         std::filesystem::remove(files[i].path, error);
         for (auto it = disk_entries.begin(); it != disk_entries.end();) {
             if ((*it)->pinned && (*it)->disk_path == removed) {
@@ -2331,7 +2342,7 @@ void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
                                             std::uint64_t protect_id, std::uint64_t keep_id) {
     for (auto it = disk_entries.begin(); it != disk_entries.end();) {
         if ((*it)->id != protect_id && (*it)->id != keep_id && !(*it)->pinned &&
-            supersedes(**it, incoming)) {
+            parked_read_pins_.count((*it)->id) == 0 && supersedes(**it, incoming)) {
             const std::size_t bytes = (*it)->bytes + sequence_metadata_bytes(**it);
             reuse_trace("parked_supersede disk id=%llu bytes=%zu",
                         static_cast<unsigned long long>((*it)->id), bytes);
@@ -2460,12 +2471,243 @@ void ProgramImplCore::drain_disk_completions() {
     }
 }
 
+void ProgramImplCore::pump_parked_io() {
+    ++parked_io_tick_;
+    drain_disk_completions();
+    drain_parked_read_completions();
+}
+
+void ProgramImplCore::drain_parked_read_completions() {
+    if (!disk_read_io) { return; }
+    std::vector<DiskReadCompletion> done;
+    disk_read_io->drain(done);
+    for (DiskReadCompletion& completion : done) {
+        parked_reads_in_flight_.erase(completion.id);
+        if (!completion.error.empty() || completion.entry == nullptr) {
+            reuse_trace("park_restore_fail id=%llu error=%s",
+                        static_cast<unsigned long long>(completion.id),
+                        completion.error.empty() ? "empty image" : completion.error.c_str());
+            const ParkedSequence* meta = find_disk_entry(completion.id);
+            const bool pinned          = meta != nullptr && meta->pinned;
+            drop_disk_entry_failed(completion.id, pinned);
+            parked_read_pins_.erase(completion.id);
+            continue;
+        }
+        // The index entry may have been evicted while the load was in flight; an open file keeps
+        // the bytes valid on POSIX, so the image is still the conversation the plan named. The
+        // consumer treats a missing index entry as already accounted.
+        completion.entry->id          = completion.id;
+        completion.entry->disk_backed = false;
+        completion.entry->disk_path.clear();
+        // The file was only needed for the read: the cached image stands on its own, and a
+        // consumer that finds the index entry evicted treats its charge as already returned. The
+        // entry becomes evictable again instead of staying pinned until another load displaces it.
+        parked_read_pins_.erase(completion.id);
+        ParkedReadSlot slot;
+        slot.charged    = completion.charged;
+        slot.bytes      = completion.charged;
+        slot.loaded_seq = parked_io_tick_;
+        slot.entry      = std::move(completion.entry);
+        parked_read_bytes_ += slot.bytes;
+        const std::uint64_t id = completion.id;
+        reuse_trace("park_restore_ready id=%llu bytes=%llu cache_bytes=%llu",
+                    static_cast<unsigned long long>(id),
+                    static_cast<unsigned long long>(slot.bytes),
+                    static_cast<unsigned long long>(parked_read_bytes_));
+        parked_reads_[id] = std::move(slot);
+        // Keep the cache bounded while never dropping the image that just arrived: at least one
+        // image is always allowed, exactly like the writer's first-job rule.
+        while (parked_read_bytes_ > kv_park_io_bytes && parked_reads_.size() > 1) {
+            auto victim = parked_reads_.end();
+            for (auto it = parked_reads_.begin(); it != parked_reads_.end(); ++it) {
+                if (it->first == id) { continue; }
+                if (victim == parked_reads_.end() ||
+                    it->second.loaded_seq < victim->second.loaded_seq) {
+                    victim = it;
+                }
+            }
+            if (victim == parked_reads_.end()) { break; }
+            reuse_trace("park_restore_drop id=%llu reason=cache_bytes bytes=%llu",
+                        static_cast<unsigned long long>(victim->first),
+                        static_cast<unsigned long long>(victim->second.bytes));
+            parked_read_bytes_ -= std::min(parked_read_bytes_, victim->second.bytes);
+            parked_read_pins_.erase(victim->first);
+            parked_reads_.erase(victim);
+        }
+    }
+}
+
+bool ProgramImplCore::parked_image_ready(std::uint64_t id) const noexcept {
+    const auto it = parked_reads_.find(id);
+    return it != parked_reads_.end() && it->second.entry != nullptr;
+}
+
+bool ProgramImplCore::submit_parked_read(std::uint64_t id) {
+    if (!disk_read_io || !is_disk_entry_id(id) || disk_read_io->busy()) { return false; }
+    if (parked_read_failed_.count(id) != 0 || parked_image_ready(id) ||
+        parked_reads_in_flight_.count(id) != 0) {
+        return false;
+    }
+    const ParkedSequence* meta = find_disk_entry(id);
+    if (meta == nullptr) { return false; }
+    const std::uint64_t charged =
+        static_cast<std::uint64_t>(meta->bytes + sequence_metadata_bytes(*meta));
+    if (!disk_read_io->has_capacity(charged)) { return false; }
+    std::vector<PagedKVPool*> text_pools;
+    std::vector<PagedKVPool*> backend_pools;
+    storage_pools(text_pools, backend_pools);
+    DiskReadJob job;
+    job.id            = id;
+    job.path          = meta->disk_path;
+    job.geometry      = image_geometry();
+    job.text_pools    = std::move(text_pools);
+    job.backend_pools = std::move(backend_pools);
+    job.charged       = charged;
+    parked_reads_in_flight_.insert(id);
+    parked_read_pins_.insert(id);
+    disk_read_io->submit(std::move(job));
+    reuse_trace("park_restore_submit id=%llu bytes=%llu",
+                static_cast<unsigned long long>(id),
+                static_cast<unsigned long long>(charged));
+    return true;
+}
+
+std::unique_ptr<ParkedSequence> ProgramImplCore::take_parked_image(std::uint64_t id) {
+    const auto it = parked_reads_.find(id);
+    if (it == parked_reads_.end() || it->second.entry == nullptr) { return nullptr; }
+    reuse_trace("park_restore_consume id=%llu bytes=%llu",
+                static_cast<unsigned long long>(id),
+                static_cast<unsigned long long>(it->second.bytes));
+    parked_read_bytes_ -= std::min(parked_read_bytes_, it->second.bytes);
+    parked_read_pins_.erase(id);
+    parked_reads_in_flight_.erase(id);
+    std::unique_ptr<ParkedSequence> entry = std::move(it->second.entry);
+    parked_reads_.erase(it);
+    return entry;
+}
+
+void ProgramImplCore::release_disk_entry_charged(const ParkedSequence& meta) noexcept {
+    if (meta.pinned) { return; }
+    const std::uint64_t id   = meta.id;
+    const std::string path   = meta.disk_path;
+    const std::size_t bytes  = meta.bytes + sequence_metadata_bytes(meta);
+    remove_sequence_files(path);
+    disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
+    for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
+        if ((*it)->id == id) {
+            disk_entries.erase(it);
+            break;
+        }
+    }
+}
+
+void ProgramImplCore::drop_disk_entry_failed(std::uint64_t id, bool pinned) noexcept {
+    parked_read_failed_.insert(id);
+    if (pinned) { return; }
+    const ParkedSequence* meta = find_disk_entry(id);
+    if (meta != nullptr) { release_disk_entry_charged(*meta); }
+}
+
+ProgramImplCore::ParkedRestoreGate
+ProgramImplCore::gate_parked_restore(const RequestPlan& plan) {
+    if (plan.impl_ == nullptr || plan.impl_->reuse != ReusePath::RestoreParkedKv) {
+        return ParkedRestoreGate::Proceed;
+    }
+    const std::uint64_t id = plan.impl_->parked_id;
+    if (!is_disk_entry_id(id)) {
+        // A RAM-tier target can be spilled out as another lane's parking victim between planning
+        // and admission. Only a plan that still resolves may start; otherwise the caller re-plans
+        // (the victim's lineage is usually present on disk under a new id by then).
+        return parked.find_by_id(id) != nullptr ? ParkedRestoreGate::Proceed
+                                                : ParkedRestoreGate::Unavailable;
+    }
+    if (!disk_read_io) { return ParkedRestoreGate::Proceed; }
+    if (parked_read_failed_.count(id) != 0) { return ParkedRestoreGate::Unavailable; }
+    if (parked_image_ready(id)) { return ParkedRestoreGate::Proceed; }
+    if (parked_reads_in_flight_.count(id) != 0) { return ParkedRestoreGate::Loading; }
+    if (find_disk_entry(id) == nullptr) { return ParkedRestoreGate::Unavailable; }
+    // Submission can be refused while the reader is busy or over its pending budget; the request
+    // simply waits another tick.
+    (void)submit_parked_read(id);
+    if (parked_reads_in_flight_.count(id) != 0) { return ParkedRestoreGate::Loading; }
+    return ParkedRestoreGate::Loading;
+}
+
+const HostCheckpoint* ProgramImplCore::shared_pinned_checkpoint(
+    const SequenceState& sequence, SharedPrefixSlot slot, std::uint32_t frontier) const noexcept {
+    if (slot == SharedPrefixSlot::Tools) { return &sequence.tools_prefix; }
+    if (slot == SharedPrefixSlot::Leading) { return &sequence.shared_prefix; }
+    if (slot == SharedPrefixSlot::Anchor) { return &sequence.resume_anchor; }
+    if (slot == SharedPrefixSlot::Response) {
+        for (const HostCheckpoint& checkpoint : sequence.response_history) {
+            if (checkpoint.frontier == frontier) { return &checkpoint; }
+        }
+        return nullptr;
+    }
+    if (slot == SharedPrefixSlot::LongRange) {
+        for (const HostCheckpoint& checkpoint : sequence.long_range_history) {
+            if (checkpoint.frontier == frontier) { return &checkpoint; }
+        }
+        return nullptr;
+    }
+    // SharedPrefixSlot::None names a checkpoint from the source's host ring, which keeps the
+    // stable boundary the pinned boundary list does not.
+    for (const HostCheckpoint& checkpoint : sequence.checkpoint_history) {
+        if (checkpoint.frontier == frontier) { return &checkpoint; }
+    }
+    for (const HostCheckpoint& boundary : sequence.boundary_history) {
+        if (boundary.frontier == frontier) { return &boundary; }
+    }
+    return nullptr;
+}
+
+ProgramImplCore::ParkedRestoreGate
+ProgramImplCore::gate_share_source(const RequestPlan& plan, const PreparedPromptData& prompt) {
+    if (plan.impl_ == nullptr || plan.impl_->reuse != ReusePath::ShareLanePrefix) {
+        return ParkedRestoreGate::Proceed;
+    }
+    const std::uint32_t source_lane = plan.impl_->share_lane;
+    const std::uint32_t frontier    = plan.impl_->reuse_base;
+    if (source_lane >= max_concurrency || frontier == 0) {
+        return ParkedRestoreGate::Unavailable;
+    }
+    const SequenceState& source = sequences[source_lane];
+    const HostCheckpoint* pinned =
+        shared_pinned_checkpoint(source, plan.impl_->share_slot, frontier);
+    const bool own_ok = pinned == nullptr || pinned->ledger.empty() ||
+                        qwen3_6::detail::prefix_matches(prompt, pinned->ledger, pinned->identity,
+                                                        frontier);
+    if (!source.kv || frontier > source.text_kv_valid || pinned == nullptr ||
+        pinned->frontier != frontier ||
+        pinned->state.size() != static_cast<std::size_t>(device_count) ||
+        pinned->hidden.size() !=
+            static_cast<std::size_t>(source.rewrite_checkpoint_hidden.bytes()) ||
+        !qwen3_6::detail::prefix_matches(prompt, source.ledger, source.prefix_identity,
+                                         frontier) ||
+        !own_ok ||
+        (speculative_backend == SpeculativeBackend::Mtp &&
+         source.mtp_kv_valid < frontier - 1)) {
+        // The source lane kept running (or resumed another branch) while this request waited.
+        reuse_trace("share_gate stale source=%u frontier=%u text_kv=%u mtp_kv=%u", source_lane,
+                    frontier, source.text_kv_valid, source.mtp_kv_valid);
+        return ParkedRestoreGate::Unavailable;
+    }
+    return ParkedRestoreGate::Proceed;
+}
+
+bool ProgramImplCore::parked_io_pending() const noexcept {
+    // Only an in-flight load can bring progress; a cached image already waits for admission.
+    return disk_read_io != nullptr && !parked_reads_in_flight_.empty();
+}
+
 void ProgramImplCore::sweep_expired_disk_entries() {
     if (kv_park_max_age_sec == 0 || disk_entries.empty()) { return; }
     const auto now     = std::filesystem::file_time_type::clock::now();
     const auto max_age = std::chrono::seconds(kv_park_max_age_sec);
     for (auto it = disk_entries.begin(); it != disk_entries.end();) {
-        if ((*it)->pinned) {
+        // An entry an admission is loading (or about to load) must survive the sweep: the restore
+        // is already committed to this lineage.
+        if ((*it)->pinned || parked_read_pins_.count((*it)->id) != 0) {
             ++it;
             continue;
         }
@@ -2557,7 +2799,10 @@ void ProgramImplCore::enforce_disk_budget() {
     while (disk_spilled_bytes > budget) {
         std::size_t oldest = disk_entries.size();
         for (std::size_t i = 0; i < disk_entries.size(); ++i) {
-            if (disk_entries[i]->pinned) { continue; }
+            if (disk_entries[i]->pinned ||
+                parked_read_pins_.count(disk_entries[i]->id) != 0) {
+                continue;
+            }
             if (oldest == disk_entries.size() ||
                 disk_entries[i]->last_used < disk_entries[oldest]->last_used) {
                 oldest = i;
@@ -2587,40 +2832,15 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
         loaded = read_sequence_image(meta.disk_path, image_geometry(), text_pools, backend_pools);
     } catch (...) {
         // Drop a poison index entry so later requests are planned against the remaining state
-        // instead of failing on the same file again.
-        const std::uint64_t id  = meta.id;
-        const std::string path  = meta.disk_path;
-        const std::size_t bytes =
-            meta.bytes + (meta.pinned ? 0 : sequence_metadata_bytes(meta));
-        if (!meta.pinned) {
-            remove_sequence_files(path);
-            disk_spilled_bytes -=
-                std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
-            for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
-                if ((*it)->id == id) {
-                    disk_entries.erase(it);
-                    break;
-                }
-            }
-        }
+        // instead of failing on the same file again. The id is remembered even for pinned images,
+        // which keep their file and index but must not be selected over and over.
+        drop_disk_entry_failed(meta.id, meta.pinned);
         throw;
     }
     loaded->id = meta.id;
     restore_parked_lane(sequence, *loaded, text_pages, backend_pages, plan.parked_checkpoint,
                         plan.checkpoint_index, plan.restore_shared_prefix, plan.reuse_base);
-    if (!meta.pinned) {
-        const std::uint64_t id   = meta.id;
-        const std::string path   = meta.disk_path;
-        const std::size_t bytes = meta.bytes + sequence_metadata_bytes(meta);
-        remove_sequence_files(path);
-        disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
-        for (auto it = disk_entries.begin(); it != disk_entries.end(); ++it) {
-            if ((*it)->id == id) {
-                disk_entries.erase(it);
-                break;
-            }
-        }
-    }
+    release_disk_entry_charged(meta);
 }
 
 bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t protect_id,
@@ -2844,7 +3064,10 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
             }
             if (spill_enabled) {
                 while (parked.used_bytes() + entry->bytes > parked.budget_bytes()) {
-                    std::unique_ptr<ParkedSequence> victim = parked.remove_least_recently_used();
+                    // The restore target an in-flight admission owns is never a victim: losing it
+                    // here is what turned a legal plan into an engine-wide failure.
+                    std::unique_ptr<ParkedSequence> victim =
+                        parked.remove_least_recently_used(protect_id);
                     if (victim == nullptr) { break; }
                     std::unique_ptr<ParkedSequence> failed = spill_entry(std::move(victim));
                     if (failed != nullptr) {

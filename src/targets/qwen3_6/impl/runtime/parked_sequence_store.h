@@ -309,8 +309,11 @@ public:
     match_checkpoint(const PreparedPromptData& prompt) const;
 
     // Disk spill support: the caller writes the removed entry out, then reinserts a metadata-only
-    // index entry (or drops it when the write fails).
-    std::unique_ptr<ParkedSequence> remove_least_recently_used();
+    // index entry (or drops it when the write fails). `protect_id` names an entry an in-flight
+    // restore plan owns: it is never chosen as a victim. Returns nullptr when the store is empty
+    // or holds only that entry, so the caller keeps the new state on disk instead of losing the
+    // restore target.
+    std::unique_ptr<ParkedSequence> remove_least_recently_used(std::uint64_t protect_id = 0);
 
     [[nodiscard]] const ParkedSequence* find_by_id(std::uint64_t id) const noexcept;
     // Non-const: a restore takes ownership of the entry's host payloads (they are moved into the
@@ -459,15 +462,18 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
 }
 
 // Removes and returns the least-recently-used entry so the caller can spill it to disk and index
-// it there. Returns nullptr when the store is empty. The caller owns the returned payload.
-inline std::unique_ptr<ParkedSequence> ParkedSequenceStore::remove_least_recently_used() {
-    if (entries_.empty()) { return nullptr; }
-    std::size_t oldest = 0;
-    for (std::size_t i = 1; i < entries_.size(); ++i) {
-        if (entries_[i]->last_used < entries_[oldest]->last_used) { oldest = i; }
+// it there. Returns nullptr when the store is empty or every entry is protected (the in-flight
+// restore target). The caller owns the returned payload.
+inline std::unique_ptr<ParkedSequence> ParkedSequenceStore::remove_least_recently_used(
+    std::uint64_t protect_id) {
+    std::optional<std::size_t> oldest;
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+        if (entries_[i]->id == protect_id) { continue; }
+        if (!oldest || entries_[i]->last_used < entries_[*oldest]->last_used) { oldest = i; }
     }
-    std::unique_ptr<ParkedSequence> entry = std::move(entries_[oldest]);
-    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(oldest));
+    if (!oldest) { return nullptr; }
+    std::unique_ptr<ParkedSequence> entry = std::move(entries_[*oldest]);
+    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*oldest));
     used_bytes_ -= entry->bytes;
     return entry;
 }

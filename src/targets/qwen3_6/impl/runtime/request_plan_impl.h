@@ -565,6 +565,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // that prefix; a short image is unusable.
         const auto parked_images_fit = [&](const qwen3_6::detail::ParkedSequence& entry,
                                            std::uint32_t frontier) {
+            // A load that already failed must not be selected again: a pinned shared-prefix image
+            // keeps its index entry, so nothing else would stop the planner from retrying it.
+            if (parked_read_failed_.count(entry.id) != 0) { return false; }
             // A disk-backed entry is only usable while its file exists; a deleted or manually
             // removed image must fall back to a normal prefill instead of failing at restore.
             if (entry.disk_backed) {
@@ -628,13 +631,25 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         // hundred tokens of prefill.
         constexpr std::uint32_t kMinimumParkedReuseTokens = 2048;
         constexpr std::uint32_t kMinimumParkedReuseGain   = 1024;
+        // A share is a live-lane borrow: its pages stay valid only while the source lane keeps
+        // them, and it replaces (parks) this lane's incumbent just like a full reset. When a
+        // parked image covers essentially the same prefix, restoring it is the safer resume.
+        // "Essentially the same" is the share rules' own gain: a share that does not lead the
+        // parked frontier by kMinimumShareGain is not worth the coupling.
+        constexpr std::uint32_t kShareParkedTolerance = 1024;
         const std::uint32_t resident_base = plan->reuse_base;
-        const bool worth_restoring =
-            candidate != nullptr && candidate_frontier > resident_base &&
+        const bool parked_over_share =
+            plan->reuse == ReusePath::ShareLanePrefix && candidate != nullptr &&
             candidate_frontier >= kMinimumParkedReuseTokens &&
-            candidate_frontier >= resident_base + kMinimumParkedReuseGain;
+            candidate_frontier + kShareParkedTolerance >= resident_base;
+        const bool worth_restoring =
+            candidate != nullptr && candidate_frontier >= kMinimumParkedReuseTokens &&
+            (candidate_frontier >= resident_base + kMinimumParkedReuseGain || parked_over_share);
         if (!worth_restoring && candidate != nullptr) {
-            reuse_trace("parked declined frontier=%u resident=%u", candidate_frontier,
+            reuse_trace("parked declined frontier=%u resident=%u share=%d", candidate_frontier,
+                        resident_base, plan->reuse == ReusePath::ShareLanePrefix ? 1 : 0);
+        } else if (parked_over_share) {
+            reuse_trace("parked_over_share frontier=%u share=%u", candidate_frontier,
                         resident_base);
         }
         if (worth_restoring) {
@@ -660,9 +675,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->restore_shared_prefix = candidate_checkpoint ? checkpoint_match->shared
                                                                : SharedPrefixSlot::None;
         }
-        reuse_trace("parked enabled=1 exact_entry=%d match_frontier=%u usable=%d resident=%u "
-                    "result=%d base=%u",
+        reuse_trace("parked enabled=1 exact_entry=%d exact_frontier=%u match_frontier=%u "
+                    "usable=%d resident=%u result=%d base=%u",
                     exact_entry != nullptr ? 1 : 0,
+                    exact_entry != nullptr ? exact_entry->execution_frontier : 0U,
                     checkpoint_match.has_value() ? checkpoint_match->frontier : 0U,
                     checkpoint_usable ? 1 : 0, resident_base,
                     static_cast<int>(plan->reuse), plan->reuse_base);
@@ -811,7 +827,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->shared_backend_kv_pages = 0;
         plan->summary.protected_lane  = runtime::kNoProtectedLane;
     }
-    reuse_trace("chosen reuse=%d base=%u index=%u parked=%llu action=%d",
+    // Per-lane candidate only: the executor plans every idle lane and executes one of them.
+    // The executed decision is the `start_prefill lane=...` line that follows.
+    reuse_trace("plan_candidate lane=%u reuse=%d base=%u index=%u parked=%llu action=%d", lane,
                 static_cast<int>(plan->reuse), plan->reuse_base, plan->checkpoint_index,
                 static_cast<unsigned long long>(plan->parked_id),
                 static_cast<int>(plan->rewrite_checkpoint_action));

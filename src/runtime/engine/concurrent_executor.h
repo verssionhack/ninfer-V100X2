@@ -369,6 +369,10 @@ private:
         std::string reasoning;
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
+        // Last tick at which admission was deferred for a disk-backed parked restore. The time
+        // spent loading is excluded from the queue deadline so a legitimate image read does not
+        // trip `--pending-timeout-ms`.
+        std::optional<Clock::time_point> restore_wait_last;
         bool decode_ready = false;
         // True when this request was the protected head of the admission queue: it could not fit
         // beside the active lanes, so the executor drained them and admitted it with the pool.
@@ -425,6 +429,9 @@ private:
         None,
         ControlProgress,
         RanGpuUnit,
+        // The head could not start yet, but nothing failed: it is waiting for its parked image.
+        // The caller may admit a backfill candidate while the load runs.
+        Deferred,
     };
 
     struct LaneChoice {
@@ -938,6 +945,39 @@ private:
                 return AdmissionProgress::ControlProgress;
             }
         }
+        // A disk-backed parked restore loads on the background reader. Hold the request in the
+        // queue until its image is in hand instead of blocking the engine on the read; the other
+        // lanes keep decoding. The gate runs AFTER the retained-eviction block: parking another
+        // lane can spill the RAM-tier entry this plan names, and the re-check here turns that
+        // into a re-plan instead of an engine-fatal "no longer stored".
+        switch (instance_.program->gate_parked_restore(*request->lane_plans[lane])) {
+        case Program::ParkedRestoreGate::Proceed:
+            request->restore_wait_last.reset();
+            break;
+        case Program::ParkedRestoreGate::Loading: {
+            const Clock::time_point now = Clock::now();
+            if (request->restore_wait_last && request->deadline != Clock::time_point::max()) {
+                request->deadline += now - *request->restore_wait_last;
+            }
+            request->restore_wait_last = now;
+            return AdmissionProgress::Deferred;
+        }
+        case Program::ParkedRestoreGate::Unavailable:
+            // The planned image can no longer be loaded; re-plan against the remaining state
+            // instead of spinning on it (the planner skips failed ids).
+            request->restore_wait_last.reset();
+            request->lane_plans[lane].reset();
+            return AdmissionProgress::Deferred;
+        }
+        // A cross-lane share plan names another lane's state, and that lane keeps running while
+        // this request waits. Re-validate the source here: if it moved on, re-plan instead of
+        // letting start_prefill_lane throw the engine-fatal "source lane is no longer available".
+        if (instance_.program->gate_share_source(*request->lane_plans[lane], request->prompt) ==
+            Program::ParkedRestoreGate::Unavailable) {
+            request->restore_wait_last.reset();
+            request->lane_plans[lane].reset();
+            return AdmissionProgress::Deferred;
+        }
 
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
@@ -1076,7 +1116,15 @@ private:
                 continue;
             }
             if (head_lane) {
-                return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
+                const AdmissionProgress progress =
+                    admit_planned_request(head, *head_lane, BackfillClass::None, 0);
+                // A deferred head is waiting for its parked image, not for capacity: leave it in
+                // the queue and serve the running lanes. It must not enter the protected-head
+                // machinery below, which assumes a capacity-blocked head.
+                if (progress == AdmissionProgress::Deferred) {
+                    return AdmissionProgress::ControlProgress;
+                }
+                return progress;
             }
 
             const ActiveAdmissionSet active = active_admission_set();
@@ -1156,8 +1204,14 @@ private:
                     backfill = BackfillClass::Temporal;
                 }
                 if (backfill != BackfillClass::None) {
-                    return admit_planned_request(candidate, *candidate_lane, backfill,
-                                                 protection_->epoch_id);
+                    const AdmissionProgress progress =
+                        admit_planned_request(candidate, *candidate_lane, backfill,
+                                              protection_->epoch_id);
+                    // A backfill candidate waiting for its parked image is just a retry: the
+                    // worker loop must see control progress, not the internal Deferred value.
+                    return progress == AdmissionProgress::Deferred
+                               ? AdmissionProgress::ControlProgress
+                               : progress;
                 }
             }
             return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
@@ -1339,6 +1393,7 @@ private:
 
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
+                instance_.program->pump_parked_io();
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
@@ -1367,6 +1422,14 @@ private:
                         continue;
                     }
                     if (progress == AdmissionProgress::ControlProgress && membership.empty()) {
+                        // A request waiting on a parked-image load cannot be admitted this tick,
+                        // and there is no decode work to run. Wait briefly instead of spinning;
+                        // the condition variable still wakes immediately on a new submission.
+                        if (instance_.program->parked_io_pending()) {
+                            std::unique_lock lock(queue_mutex_);
+                            queue_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                                               [&] { return stopping_; });
+                        }
                         continue;
                     }
                 }

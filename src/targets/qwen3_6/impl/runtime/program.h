@@ -27,6 +27,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -354,6 +356,22 @@ public:
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan& plan) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    // Disk-backed parked restores load on the background reader instead of blocking the worker.
+    // The gate runs on the worker before a lane starts: `Loading` means the request must stay
+    // queued until the image arrives, `Unavailable` means the planned entry can no longer be
+    // loaded and the caller must re-plan (the request is not at fault).
+    enum class ParkedRestoreGate : std::uint8_t { Proceed, Loading, Unavailable };
+    [[nodiscard]] ParkedRestoreGate gate_parked_restore(const RequestPlan& plan);
+    // A cross-lane share plan names another lane's KV pages and pinned checkpoints, and that lane
+    // keeps running while this request waits for admission. Re-validate the source immediately
+    // before start; `Unavailable` asks the caller to re-plan instead of failing the lane.
+    [[nodiscard]] ParkedRestoreGate gate_share_source(const RequestPlan& plan,
+                                                      const PreparedPromptData& prompt);
+    // Worker tick: moves finished background spills and loads into the parked index and cache.
+    void pump_parked_io();
+    // True while a restore load is queued, in progress, or cached for an admission that has not
+    // started yet. The worker uses it to avoid spinning while it waits for the image.
+    [[nodiscard]] bool parked_io_pending() const noexcept;
     // `max_tokens` bounds one step below the configured prefill chunk, so a scheduler can slice a
     // long prefill and give other lanes decode rounds in between; zero uses the full chunk.
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
@@ -511,6 +529,27 @@ public:
     const std::uint64_t kv_park_max_age_sec;
     // Background FIFO spill writer; null when spill I/O is synchronous or no directory is set.
     std::unique_ptr<ParkedDiskIo> disk_io;
+    // Background FIFO reader for disk-backed restores; null when `kv_park_io_bytes` is zero (the
+    // restore then reads synchronously on the worker, as before).
+    std::unique_ptr<ParkedDiskReader> disk_read_io;
+    // Worker-side image cache for async restores, keyed by disk entry id. The cache holds at most
+    // one image beyond the configured I/O budget (the writer's first-job rule), so a request that
+    // is still waiting for a lane keeps its loaded image; a newer load displaces the oldest.
+    // `charged` is the index charge the entry held (metadata included) so consumption can release
+    // it exactly once.
+    struct ParkedReadSlot {
+        std::unique_ptr<ParkedSequence> entry;
+        std::uint64_t charged    = 0;
+        std::uint64_t bytes      = 0;
+        std::uint64_t loaded_seq = 0;
+    };
+    std::unordered_map<std::uint64_t, ParkedReadSlot> parked_reads_;
+    std::unordered_set<std::uint64_t> parked_reads_in_flight_;
+    std::unordered_set<std::uint64_t> parked_read_failed_;
+    // In-flight/cached entries the evictors must leave alone until the load is consumed or dropped.
+    std::unordered_set<std::uint64_t> parked_read_pins_;
+    std::uint64_t parked_read_bytes_ = 0;
+    std::uint64_t parked_io_tick_    = 0;
     // While the startup index is being built, budget enforcement must not age-expire entries:
     // the prefetch that runs right after loading has first claim on the most recent images.
     bool disk_index_loading_ = false;
@@ -695,6 +734,19 @@ private:
     // Moves finished background writes into disk_entries and prunes superseded states. Runs only
     // on the worker thread.
     void drain_disk_completions();
+    // Starts loading a disk entry for the admission that is about to start. Returns false when the
+    // id is not a disk entry, the load already exists/failed, or the reader has no capacity.
+    bool submit_parked_read(std::uint64_t id);
+    // Moves finished loads into the cache; a failed load drops a non-pinned entry from the index
+    // and is remembered so re-planning skips it.
+    void drain_parked_read_completions();
+    [[nodiscard]] bool parked_image_ready(std::uint64_t id) const noexcept;
+    [[nodiscard]] std::unique_ptr<ParkedSequence> take_parked_image(std::uint64_t id);
+    // Removes a disk index entry and releases its charge exactly once: a no-op when the entry is
+    // already gone (an evictor subtracted it) or pinned (shared-prefix images are not charged).
+    void release_disk_entry_charged(const ParkedSequence& meta) noexcept;
+    // Drops a failed load's index entry (never a pinned image) and remembers the id as unusable.
+    void drop_disk_entry_failed(std::uint64_t id, bool pinned) noexcept;
     // Startup: reads the MRU spilled conversations back into the RAM tier (fixed MRU order).
     void prefetch_disk_entries();
     // Deletes spilled images idle longer than kv_park_max_age_sec. Byte-budget LRU still applies.
@@ -724,6 +776,11 @@ private:
     // checkpoint slot is written and the resident checkpoint path copies it forward.
     void import_checkpoint_state(SequenceState& sequence, const HostCheckpoint& checkpoint,
                                  bool into_current);
+    // The host checkpoint a cross-lane share plan intends to import, resolved by slot (and by
+    // frontier for the history lists). Shared by the admission gate and start_prefill_lane.
+    [[nodiscard]] const HostCheckpoint*
+    shared_pinned_checkpoint(const SequenceState& sequence, SharedPrefixSlot slot,
+                             std::uint32_t frontier) const noexcept;
     // Pinned staging window sized to one GDN slot image, shared by every rank's park/restore.
     [[nodiscard]] std::span<std::byte> slot_image_staging();
     // Copies a pageable slot image into the pinned window and imports it into `slot`.
