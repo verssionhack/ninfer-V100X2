@@ -743,6 +743,11 @@ private:
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         request->prefill_processed_tokens += step.processed_prompt_tokens;
         consume_service_work(request, step.service_units);
+        // The resume decision is fixed when start_prefill_lane consumes the plan and does not
+        // change across steps, so record it before the completion/cancel branches: a request
+        // cancelled mid-prefill still reports the prefix it actually resumed from instead of
+        // the FullReset default.
+        request->begin = step.summary;
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
@@ -770,7 +775,6 @@ private:
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
         }
-        request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }
@@ -858,15 +862,23 @@ private:
     find_admission_lane(const std::shared_ptr<Request>& request) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
+        bool selected_retained       = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            // Starting on a retained lane parks its conversation first. Parking copies the whole
+            // KV to host and may have to spill it to disk, so when two lanes give the same reuse,
+            // take the one that is actually empty: a parked restore must not evict a conversation
+            // it did not need to.
+            const bool retained = instance_.program->has_retained_lane(lane);
             if (instance_.program->can_admit_lane(lane, plan) &&
-                (!selected || reuse > selected_reuse)) {
-                selected       = LaneChoice{.lane = lane};
-                selected_reuse = reuse;
+                (!selected || reuse > selected_reuse ||
+                 (reuse == selected_reuse && selected_retained && !retained))) {
+                selected          = LaneChoice{.lane = lane};
+                selected_reuse    = reuse;
+                selected_retained = retained;
             }
         }
         if (selected) { return selected; }

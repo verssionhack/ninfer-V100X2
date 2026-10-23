@@ -1931,7 +1931,7 @@ void ProgramImplCore::persist_state() {
     std::size_t written = 0;
     std::size_t failed  = 0;
     while (std::unique_ptr<ParkedSequence> entry = parked.remove_least_recently_used()) {
-        if (spill_entry(std::move(entry)) == nullptr) {
+        if (spill_entry(std::move(entry), 0, /*wait_for_capacity=*/true) == nullptr) {
             ++written;
         } else {
             ++failed;
@@ -2356,7 +2356,7 @@ void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
 }
 
 std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
-    std::unique_ptr<ParkedSequence> entry, std::uint64_t protect_id) {
+    std::unique_ptr<ParkedSequence> entry, std::uint64_t protect_id, bool wait_for_capacity) {
     if (park_spill_dir.empty() || entry == nullptr) { return entry; }
     std::uint64_t charged = 0;
     bool charged_pending   = false;
@@ -2368,6 +2368,26 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         const std::filesystem::path path =
             std::filesystem::path(park_spill_dir) /
             ("park-" + std::to_string(next_disk_entry) + ".img");
+        charged = entry->bytes + sequence_metadata_bytes(*entry);
+        if (disk_io) {
+            // The pending-byte budget caps the host RAM held by queued payloads. Parking is
+            // best-effort, so when the writer cannot take this image, hand the entry back
+            // instead of sleeping on the in-flight write: a parked-restore start parks the
+            // incumbent lane, and blocking here freezes prefill for the whole multi-gigabyte
+            // write (minutes on a single disk). The caller keeps the entry in RAM or declines
+            // the park. Only the shutdown flush may wait, because losing the conversation
+            // there is worse than a slow exit.
+            for (;;) {
+                drain_disk_completions();
+                if (disk_io->has_capacity(charged)) { break; }
+                if (!wait_for_capacity) {
+                    reuse_trace("park_spill_defer path=%s bytes=%llu", path.c_str(),
+                                static_cast<unsigned long long>(charged));
+                    return entry;
+                }
+                disk_io->wait_for_change();
+            }
+        }
         // Page counts are part of the sidecar (the planner checks them against the request's
         // entitlement before restoring), so record them before writing it.
         for (const std::unique_ptr<PagedKVImage>& image : entry->text) {
@@ -2381,7 +2401,6 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         entry->pinned      = false;
         entry->id          = kDiskEntryIdBase + next_disk_entry++;
         entry->last_used   = park_clock++;
-        charged            = entry->bytes + sequence_metadata_bytes(*entry);
 
         ParkedSequence probe;
         probe.execution_frontier    = entry->execution_frontier;
@@ -2395,13 +2414,6 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
             // states after the index entry becomes visible.
             disk_spilled_bytes += charged;
             charged_pending = true;
-            for (;;) {
-                // Pending bytes are released only by drain, so a full budget wakes the worker,
-                // which drains and retries. The first job is always admitted.
-                drain_disk_completions();
-                if (disk_io->has_capacity(charged)) { break; }
-                disk_io->wait_for_change();
-            }
             disk_io->submit(DiskSpillJob{
                 .entry = std::move(entry),
                 .path = path.string(),
@@ -2914,7 +2926,8 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                     "ram_used=%zu ram_entries=%zu disk_entries=%zu disk_bytes=%llu",
                     detach ? "" : "_snapshot", lane, sequence.execution_frontier, planned,
                     parked.budget_bytes(),
-                    planned <= parked.budget_bytes() ? 1 : 0, sequence.checkpoint_history.size(),
+                    parked.used_bytes() + planned <= parked.budget_bytes() ? 1 : 0,
+                    sequence.checkpoint_history.size(),
                     parked.used_bytes(), parked.entry_count(), disk_entries.size(),
                     static_cast<unsigned long long>(disk_spilled_bytes));
         if (!spill_enabled && planned > parked.budget_bytes()) { return false; }
@@ -3054,8 +3067,12 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         probe.prefix_identity    = entry->prefix_identity;
 
         // RAM first: drop superseded copies when that arithmetic guarantees the insert, make
-        // room by spilling the least-recently-used conversations, then insert. `insert` destroys
-        // its argument when it refuses, so the space check is made before the call.
+        // room by spilling the least-recently-used conversations, then insert. With a spill
+        // directory the victims must be written out before their bytes can be reused. Without
+        // one the store still evicts its own least-recently-used entries rather than refusing a
+        // new state beside stale conversations -- refusing there dropped the KV of a large
+        // context on every turn and made the next turn re-prefill all of it. `insert` destroys
+        // its argument when it refuses, so reaching the trace below means this state is lost.
         if (parked.enabled() && entry->bytes <= parked.budget_bytes()) {
             const std::uint64_t reclaim = superseded_ram_bytes(probe, protect_id);
             const std::uint64_t used    = parked.used_bytes();
@@ -3078,13 +3095,23 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
                     }
                 }
             }
-            if (parked.used_bytes() + entry->bytes <= parked.budget_bytes() &&
-                parked.insert(std::move(entry), park_clock++, protect_id).has_value()) {
-                prune_superseded_disk(probe, protect_id);
-                // A snapshot leaves the lane intact: the caller still resumes on it.
-                if (detach) { clear_lane(sequence, requests[lane]); }
-                return true;
+            // With a disk tier the loop above has already made room; inserting past the budget
+            // there would evict an entry that was just spilled. Without one, leave the space
+            // decision to the store: it evicts its LRU entries and refuses only when the entry
+            // alone -- or a protected restore target -- cannot fit.
+            if (!spill_enabled ||
+                parked.used_bytes() + entry->bytes <= parked.budget_bytes()) {
+                if (parked.insert(std::move(entry), park_clock++, protect_id).has_value()) {
+                    prune_superseded_disk(probe, protect_id);
+                    // A snapshot leaves the lane intact: the caller still resumes on it.
+                    if (detach) { clear_lane(sequence, requests[lane]); }
+                    return true;
+                }
             }
+            reuse_trace("park refused lane=%u frontier=%u planned=%zu used=%zu budget=%zu "
+                        "spill=%d",
+                        lane, probe.execution_frontier, planned, parked.used_bytes(),
+                        parked.budget_bytes(), spill_enabled ? 1 : 0);
         }
         // The conversation is too large for the RAM tier (or the tier is disabled): keep it on
         // disk when a spill directory is configured. Disk copies are pruned only after the new

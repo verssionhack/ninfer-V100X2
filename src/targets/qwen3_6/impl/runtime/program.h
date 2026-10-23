@@ -407,8 +407,9 @@ public:
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // Copies a retained lane's complete continuation state to the park store and clears the lane,
     // returning true when it was parked. Best-effort and infallible by contract: a lane that
-    // cannot be parked (parking disabled, RAM KV, Vision, or no room left in the store) is
-    // reported false and left untouched, so the caller can fall back to dropping it.
+    // cannot be parked (parking disabled, RAM KV, Vision, or no room can be made even by
+    // evicting the store's least-recently-used entries) is reported false and left untouched,
+    // so the caller can fall back to dropping it.
     // `protect_id` names a stored entry the insert must not evict (the plan's restore target).
     // With `detach == false` the state is snapshotted without disturbing the lane: the pages are
     // copied rather than released, so a caller that is about to trim the lane for another branch
@@ -729,8 +730,11 @@ private:
     // With the background writer this only submits the job; the index entry appears when the
     // worker drains completions. Returns nullptr on success; on failure it returns the
     // still-intact entry so the caller can reinsert or drop it deliberately.
+    // `wait_for_capacity` blocks until the writer can own the payload. Only the shutdown flush
+    // sets it: serving must never stall prefill or decode on a multi-gigabyte image write.
     std::unique_ptr<ParkedSequence> spill_entry(std::unique_ptr<ParkedSequence> entry,
-                                                std::uint64_t protect_id = 0);
+                                                std::uint64_t protect_id = 0,
+                                                bool wait_for_capacity   = false);
     // Moves finished background writes into disk_entries and prunes superseded states. Runs only
     // on the worker thread.
     void drain_disk_completions();
