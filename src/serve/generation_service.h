@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -50,6 +51,8 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
+    // Raw prefill logits for GenerationRequest::score_token_ids (empty otherwise).
+    std::vector<float> token_scores;
 
     [[nodiscard]] CompletionUsage usage() const {
         return {prompt_tokens, completion_tokens,
@@ -107,6 +110,12 @@ public:
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
+    }
+
+    // Protocol adapters that must address individual vocabulary tokens (e.g. option labels).
+    [[nodiscard]] std::vector<ninfer::TokenId>
+    encode_text(std::string_view text, bool parse_added_tokens = false) const {
+        return engine_->encode_text(text, parse_added_tokens);
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,

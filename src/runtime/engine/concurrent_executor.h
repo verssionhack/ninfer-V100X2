@@ -365,6 +365,9 @@ private:
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
         std::vector<TokenId> generated;
+        // Raw prefill logits for options.execution.score_token_ids, captured by the scoring branch
+        // in resolve_prefill_step. Empty for ordinary generation requests.
+        std::vector<float> token_scores;
         std::string content;
         std::string reasoning;
         std::optional<std::uint32_t> lane;
@@ -514,6 +517,7 @@ private:
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
+        result.token_scores            = std::move(request->token_scores);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
@@ -777,6 +781,23 @@ private:
         }
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
+        }
+        if (!request->options.execution.score_token_ids.empty()) {
+            // Scoring requests end on prefill's own token. Read the target logits before the lane
+            // is resolved, then skip the OutputSession entirely: the sampled token is irrelevant
+            // and preview can throw on an invalid-UTF8 or special token. No decode round runs.
+            try {
+                request->token_scores = instance_.program->prefill_scores(
+                    *request->lane, request->options.execution.score_token_ids);
+                instance_.program->resolve_prefill_lane(*request->lane, /*terminal=*/true);
+            } catch (...) {
+                fail_request_scope(request, *request->lane, std::current_exception());
+                remove_completed_slot(*request->lane);
+                return;
+            }
+            complete_success(request, FinishReason::OutputLimit);
+            remove_completed_slot(*request->lane);
+            return;
         }
         if (resolve_round(request, step.round.tokens.front(), false)) {
             remove_completed_slot(*request->lane);

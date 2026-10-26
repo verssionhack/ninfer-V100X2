@@ -24,6 +24,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.score_token_ids         = std::move(options.execution.score_token_ids);
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -315,6 +316,16 @@ std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& 
         impl_->active);
 }
 
+std::vector<TokenId> Engine::encode_text(std::string_view text, bool parse_added_tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.encode_text(text, parse_added_tokens);
+        },
+        impl_->active);
+}
+
 PromptCapabilities Engine::prompt_capabilities() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
@@ -338,6 +349,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+    if (!resolved_options.execution.score_token_ids.empty() &&
+        resolved_options.execution.requested_output_tokens != 1) {
+        // Validate before the zero-output early return, which bypasses the executor plan.
+        throw std::invalid_argument("scoring requests require requested_output_tokens == 1");
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

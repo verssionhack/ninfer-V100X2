@@ -308,6 +308,12 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Scoring mode: when non-empty, the request returns the logits at the position after the
+    // prompt for these token ids in `GenerationResult::token_scores` and publishes no generated
+    // text. It requires `requested_output_tokens == 1`: zero never runs prefill, and one keeps the
+    // prefill's sampled token from being used as speculative-draft input (which would overwrite
+    // the target logits). Ids must be unique and inside the target's token domain.
+    std::vector<TokenId> score_token_ids;
 };
 
 struct OutputOptions {
@@ -561,6 +567,10 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // Raw logits for ExecutionOptions::score_token_ids, in the same order. The values are the
+    // engine's own BF16 prefill logits widened to float (not probabilities); callers own any
+    // softmax/normalization. Empty unless scoring was requested.
+    std::vector<float> token_scores;
 };
 
 struct ArenaMemorySummary {

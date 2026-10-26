@@ -1020,7 +1020,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request_plan.reuse != ReusePath::RestoreParkedKv) {
         restore_historical_checkpoint(
             sequence, request_plan.checkpoint_index,
-            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew);
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew ||
+                request_plan.rewrite_checkpoint_action ==
+                    RewriteCheckpointAction::SkipCapture);
     }
     if (request_plan.restore_shared_prefix != SharedPrefixSlot::None &&
         speculative_backend == SpeculativeBackend::DFlash) {
@@ -1058,7 +1060,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         rotate_device_checkpoint(sequence);
         import_checkpoint_state(sequence, *pinned, /*into_current=*/false);
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+    if ((request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew ||
+         request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::SkipCapture) &&
         sequence.rewrite_checkpoint.valid) {
         rotate_device_checkpoint(sequence);
     }
@@ -1106,6 +1109,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
         prompt.identity.rewrite_checkpoint) {
         throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
+    }
+    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::SkipCapture &&
+        request_plan.rewrite_checkpoint_capture) {
+        throw std::logic_error("planned rewrite checkpoint skip has a capture");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture &&
         (!prompt.identity.rewrite_checkpoint || request_plan.reuse == ReusePath::FullReset ||
@@ -1280,7 +1287,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
 
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
-            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew ||
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::SkipCapture) {
             sequence.rewrite_checkpoint = {};
             sequence.checkpoint_ledger.clear();
             sequence.checkpoint_identity.clear();
@@ -3556,12 +3564,47 @@ HostCheckpoint ProgramImplCore::export_checkpoint(SequenceState& sequence) {
     return checkpoint;
 }
 
+bool ProgramImplCore::checkpoint_already_retained(const SequenceState& sequence) const {
+    if (!sequence.rewrite_checkpoint.valid || sequence.rewrite_checkpoint.frontier == 0) {
+        return false;
+    }
+    // Same provenance selection export_checkpoint uses: the ledger and identity the checkpoint
+    // was captured from, not the lane's live continuation.
+    const bool own_provenance = !sequence.checkpoint_ledger.empty();
+    const std::span<const TokenId> ledger(own_provenance ? sequence.checkpoint_ledger
+                                                         : sequence.ledger);
+    const ResidentPrefixIdentity& identity = own_provenance ? sequence.checkpoint_identity
+                                                            : sequence.prefix_identity;
+    const auto holds = [&](const HostCheckpoint& retained) {
+        return checkpoint_boundary_matches(retained, sequence.rewrite_checkpoint.kind,
+                                           sequence.rewrite_checkpoint.frontier, ledger, identity);
+    };
+    const auto holds_any = [&](const std::vector<HostCheckpoint>& history) {
+        return std::any_of(history.begin(), history.end(), holds);
+    };
+    return holds_any(sequence.checkpoint_history) || holds_any(sequence.boundary_history) ||
+           holds_any(sequence.response_history) || holds_any(sequence.long_range_history) ||
+           holds(sequence.shared_prefix) || holds(sequence.tools_prefix) ||
+           holds(sequence.resume_anchor);
+}
+
 void ProgramImplCore::rotate_device_checkpoint(SequenceState& sequence) {
     // DFlash keeps its checkpoint in its own context state, which the host history does not
     // mirror, so its boundaries are never offered as reuse candidates; keeping them would only
     // cost host memory and a copy per turn.
     if (speculative_backend == SpeculativeBackend::DFlash) { return; }
     if (!sequence.rewrite_checkpoint.valid) { return; }
+    // The capture path pins message and response boundaries immediately, so the next request's
+    // rotation usually finds the same boundary already mirrored. export_checkpoint would copy
+    // every rank's recurrent slot and hidden to the host only for push_host_checkpoint to drop
+    // the duplicate; check first and skip the copy.
+    if (checkpoint_already_retained(sequence)) {
+        reuse_trace("rotate_skip lane=%u frontier=%u kind=%d history=%zu", sequence.lane,
+                    sequence.rewrite_checkpoint.frontier,
+                    static_cast<int>(sequence.rewrite_checkpoint.kind),
+                    sequence.checkpoint_history.size());
+        return;
+    }
     reuse_trace("rotate lane=%u frontier=%u kind=%d history=%zu", sequence.lane,
                 sequence.rewrite_checkpoint.frontier,
                 static_cast<int>(sequence.rewrite_checkpoint.kind),
@@ -4805,6 +4848,36 @@ void ProgramImplCore::copy_round_logits() {
     CUDA_CHECK(cudaMemcpyAsync(logits_capture.data(), io.logits.data,
                                logits_capture.size() * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, device.stream));
+}
+
+std::vector<float> ProgramImplCore::prefill_scores(std::uint32_t lane,
+                                                   std::span<const TokenId> token_ids) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (requests[lane].pending.kind != PendingKind::Begin) {
+        throw std::logic_error("prefill scores require a completed prefill round");
+    }
+    if (token_ids.empty()) { return {}; }
+    const std::size_t rows = static_cast<std::size_t>(io.logits.ne[0]);
+    for (const TokenId id : token_ids) {
+        if (id < 0 || id >= TextConfig::token_domain ||
+            static_cast<std::size_t>(id) >= rows) {
+            throw std::invalid_argument("score token id is outside the logits domain");
+        }
+    }
+    // The completed prefill synchronized the device at the end of advance_prefill, and no GPU
+    // work runs between that return and this call (the executor invokes it on the worker thread
+    // before resolving the lane).
+    prefill_score_scratch.resize(rows);
+    CUDA_CHECK(cudaMemcpy(prefill_score_scratch.data(), io.logits.data,
+                          rows * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+    std::vector<float> scores(token_ids.size());
+    for (std::size_t i = 0; i < token_ids.size(); ++i) {
+        const std::uint32_t bits =
+            static_cast<std::uint32_t>(prefill_score_scratch[static_cast<std::size_t>(token_ids[i])]);
+        const std::uint32_t widened = bits << 16;
+        std::memcpy(&scores[i], &widened, sizeof(float));
+    }
+    return scores;
 }
 
 void ProgramImplCore::enable_logits_capture(bool enabled) {

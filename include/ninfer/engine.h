@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <string_view>
 #include <utility>
 
 namespace ninfer {
@@ -84,6 +85,14 @@ public:
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
+
+    // Plain content tokenization with the artifact's tokenizer: no chat template and no
+    // special/added-token parsing unless `parse_added_tokens` is set. Used by protocol adapters
+    // that must address individual vocabulary tokens (e.g. option labels); throws
+    // std::invalid_argument on invalid UTF-8. The tokenizer is immutable after construction, so
+    // calls may run concurrently with prompt preparation.
+    [[nodiscard]] std::vector<TokenId> encode_text(std::string_view text,
+                                                   bool parse_added_tokens = false) const;
 
     // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
     // request; wait() owns result consumption and may run independently from GPU execution.

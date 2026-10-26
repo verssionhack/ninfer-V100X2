@@ -407,6 +407,8 @@ if(NINFER_BUILD_SERVE)
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
+    serve/systemone_schema.cpp
+    serve/systemone_service.cpp
     serve/response_store.cpp
     serve/tool_call_parser.cpp
     serve/translate.cpp

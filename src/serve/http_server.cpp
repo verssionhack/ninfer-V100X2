@@ -4,6 +4,8 @@
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
+#include "serve/systemone_schema.h"
+#include "serve/systemone_service.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -313,6 +315,9 @@ void HttpServer::register_routes() {
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
+    server_.Post("/v1/systemone", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_systemone(req, res);
+    });
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
@@ -553,6 +558,49 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         error.type    = "internal_error";
         error.message = e.what();
         write_messages_error(res, error);
+    }
+}
+
+void HttpServer::handle_systemone(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception&) {
+        ApiError error;
+        error.status  = 400;
+        error.message = "request body is not valid JSON";
+        write_error(res, error);
+        return;
+    }
+    try {
+        SystemoneRequest request = parse_systemone_request(body);
+        if (request.model && !request.model->empty() && *request.model != public_model_id_) {
+            ApiError error;
+            error.status  = 404;
+            error.type    = "invalid_request_error";
+            error.code    = "model_not_found";
+            error.message = "model '" + *request.model + "' not found";
+            throw ApiException(std::move(error));
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        SystemoneRunResult result = execute_systemone(
+            request, public_model_id_, *service_,
+            [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - started)
+                                   .count();
+        log_line("systemone questions=" + std::to_string(request.questions.size()) +
+                 " input_tokens=" + std::to_string(result.input_tokens) +
+                 " seconds=" + std::to_string(seconds));
+
+        const nlohmann::json response = make_systemone_response(
+            public_model_id_, std::move(result.answers), result.input_tokens);
+        res.set_content(response.dump(), "application/json");
+    } catch (const ApiException& e) {
+        write_error(res, e.error());
+    } catch (const std::exception& e) {
+        write_exception(res, e);
     }
 }
 

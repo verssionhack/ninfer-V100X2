@@ -1052,6 +1052,14 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
 
+std::vector<TokenId> Frontend::encode_text(std::string_view text,
+                                           bool parse_added_tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("Frontend is moved from"); }
+    const std::vector<int> ids =
+        impl_->tokenizer->encode(text, fi::EncodeOptions{.parse_added_tokens = parse_added_tokens});
+    return std::vector<TokenId>(ids.begin(), ids.end());
+}
+
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {
     return impl_ != nullptr ? impl_->chat_template.capabilities() : PromptCapabilities{};
 }

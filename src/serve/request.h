@@ -182,6 +182,9 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
+    // Internal scoring extension (see ninfer::ExecutionOptions::score_token_ids). Set by the
+    // /v1/systemone adapter; no OpenAI/Anthropic schema parses it. Requires max_tokens == 1.
+    std::vector<TokenId> score_token_ids;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

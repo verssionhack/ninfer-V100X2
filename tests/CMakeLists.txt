@@ -305,6 +305,9 @@ ninfer_add_test(ninfer_response_store_test
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_systemone_schema_test
+  SOURCES test_systemone_schema.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
   LIBRARIES ninfer_serve)

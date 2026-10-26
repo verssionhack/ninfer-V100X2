@@ -23,6 +23,8 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Non-empty requests a prefill score-only result; see ExecutionOptions::score_token_ids.
+    std::vector<TokenId> score_token_ids;
 };
 
 struct ResolvedRequestOptions {

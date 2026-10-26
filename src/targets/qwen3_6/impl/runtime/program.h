@@ -53,6 +53,9 @@ enum class RewriteCheckpointAction : std::uint8_t {
     KeepExisting,
     ReclassifyExisting,
     CaptureNew,
+    // CaptureNew for a prefill-only scoring request: preserve the outgoing checkpoint, then leave
+    // the slot empty instead of writing a response boundary no later request can use.
+    SkipCapture,
     DeferCapture,
 };
 
@@ -77,6 +80,9 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    // The request ends on prefill and publishes no assistant text (see
+    // ResolvedExecutionOptions::score_token_ids), so its response checkpoint can never be reused.
+    bool prefill_only_scoring = false;
     std::optional<qwen3_6::RewriteCheckpointSpec> stable_checkpoint;
     std::vector<qwen3_6::RewriteCheckpointSpec> message_checkpoints;
     std::optional<qwen3_6::RewriteCheckpointSpec> prefix_checkpoint;
@@ -582,6 +588,10 @@ public:
     // engine -- concurrent lanes would overwrite it out of order.
     std::vector<std::uint16_t> logits_capture;
     bool logits_capture_enabled = false;
+    // Request-scoped scoring reuse: the full-vocabulary BF16 logits of the prefill that just
+    // completed, copied to the host on demand by prefill_scores(). Allocated lazily (≈0.5 MB) and
+    // reused; independent of the debug capture above.
+    std::vector<std::uint16_t> prefill_score_scratch;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
@@ -626,6 +636,11 @@ public:
     // logits row count; disabling releases it. Must not be called while a round is in flight (the
     // executor holds its execution mutex across this call).
     void enable_logits_capture(bool enabled);
+
+    // See Program::prefill_scores. Requires the lane's completed prefill Begin pending; reads
+    // io.logits, which is still the target head for a one-output-token request.
+    [[nodiscard]] std::vector<float> prefill_scores(std::uint32_t lane,
+                                                    std::span<const TokenId> token_ids);
 
     // Debug-only, OFF by default: after each MTP decode round at device_count == 2, read rank 1's MTP egress
     // back and compare it field for field with rank 0's. The two ranks run the acceptance Op over
@@ -792,7 +807,11 @@ private:
     void import_slot_staged(LinearAttentionStatePool& state, std::int32_t slot,
                             std::span<const std::byte> image, cudaStream_t stream);
     [[nodiscard]] HostCheckpoint export_checkpoint(SequenceState& sequence);
-    // Moves the lane's current checkpoint into its host history, if one is valid.
+    // True when the lane's current checkpoint (kind + frontier + lineage) is already mirrored in
+    // one of the host histories or pinned slots, so moving it there would only re-copy bytes.
+    [[nodiscard]] bool checkpoint_already_retained(const SequenceState& sequence) const;
+    // Moves the lane's current checkpoint into its host history, if one is valid and not
+    // already retained.
     void rotate_device_checkpoint(SequenceState& sequence);
     // Resolves a plan that resumes from a historical boundary: preserves the current device
     // checkpoint, imports the selected one, and (when the request will capture a new checkpoint)

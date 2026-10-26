@@ -67,15 +67,25 @@ struct HostCheckpoint {
     std::size_t bytes = 0;
 };
 
+// True when the retained checkpoint describes the lineage `(kind, frontier, ledger[0, frontier),
+// identity)` and can stand in for a fresh export of it. A retained checkpoint without provenance
+// (its ledger shorter than its own frontier) matches on kind and frontier alone, like
+// same_checkpoint_boundary treats legacy entries.
+inline bool checkpoint_boundary_matches(const HostCheckpoint& retained, RewriteCheckpointKind kind,
+                                        std::uint32_t frontier, std::span<const TokenId> ledger,
+                                        const ResidentPrefixIdentity& identity) noexcept {
+    if (retained.frontier != frontier || retained.kind != kind) { return false; }
+    if (retained.ledger.size() < retained.frontier || ledger.size() < frontier) { return true; }
+    return std::equal(retained.ledger.begin(),
+                      retained.ledger.begin() + static_cast<std::ptrdiff_t>(frontier),
+                      ledger.begin()) &&
+           retained.identity.same_prefix(identity, frontier);
+}
+
 // True when two retained checkpoints describe the same lineage at the same boundary. Without
 // provenance the boundary alone is the key (legacy/unit-test entries).
 inline bool same_checkpoint_boundary(const HostCheckpoint& a, const HostCheckpoint& b) noexcept {
-    if (a.frontier != b.frontier || a.kind != b.kind) { return false; }
-    if (a.ledger.size() < a.frontier || b.ledger.size() < b.frontier) { return true; }
-    return std::equal(a.ledger.begin(),
-                      a.ledger.begin() + static_cast<std::ptrdiff_t>(a.frontier),
-                      b.ledger.begin()) &&
-           a.identity.same_prefix(b.identity, a.frontier);
+    return checkpoint_boundary_matches(a, b.kind, b.frontier, b.ledger, b.identity);
 }
 
 // Inserts `checkpoint` at the front of `history`, replacing an entry for the same boundary and

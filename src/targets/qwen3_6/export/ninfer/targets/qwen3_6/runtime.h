@@ -213,6 +213,14 @@ public:
     [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept;
     void enable_logits_capture(bool enabled);
 
+    // Reads the target logits of the lane's just-completed prefill for the requested token ids.
+    // Preconditions: `lane` has a pending Begin round from a prefill that just returned, and the
+    // request planned exactly one output token (so MTP did not replace io.logits with proposal
+    // logits). Worker-thread only, while the Program's execution mutex is held. Returns the raw
+    // BF16-valued logits widened to float, in the same order as `token_ids`.
+    [[nodiscard]] std::vector<float> prefill_scores(std::uint32_t lane,
+                                                    std::span<const TokenId> token_ids);
+
     // Debug-only, OFF by default: after each MTP decode round at tp == 2, compare rank 1's MTP
     // egress record with rank 0's. The ranks run the acceptance Op over bit-identical inputs, so
     // the records are argued to agree; enabling this measures it instead. Off, execution is

@@ -14,6 +14,7 @@
 using ninfer::TokenId;
 using ninfer::targets::qwen3_6::PreparedPromptData;
 using ninfer::targets::qwen3_6::RewriteCheckpointKind;
+using ninfer::targets::qwen3_6::detail::checkpoint_boundary_matches;
 using ninfer::targets::qwen3_6::detail::HostCheckpoint;
 using ninfer::targets::qwen3_6::detail::ParkedSequence;
 using ninfer::targets::qwen3_6::detail::ParkedSequenceStore;
@@ -235,6 +236,38 @@ int main() {
           "a refused protected insert must not evict anything");
     check(protected_full.find_by_id(*protected_small) != nullptr,
           "a refused protected insert must leave the other entries intact");
+
+    // Rotation uses this predicate to skip an export whose boundary is already retained: kind,
+    // frontier and lineage must all agree, and an entry without provenance matches on kind and
+    // frontier alone.
+    const PreparedPromptData lineage = prompt_of({90, 91, 92, 93});
+    const HostCheckpoint retained    = checkpoint_of({90, 91, 92, 93}, 3);
+    check(checkpoint_boundary_matches(retained, RewriteCheckpointKind::ResponseReplay, 3,
+                                      lineage.token_ids, retained.identity),
+          "an identical boundary and lineage must match");
+    check(!checkpoint_boundary_matches(retained, RewriteCheckpointKind::TurnClosure, 3,
+                                       lineage.token_ids, retained.identity),
+          "a different checkpoint kind must not match");
+    check(!checkpoint_boundary_matches(retained, RewriteCheckpointKind::ResponseReplay, 2,
+                                       lineage.token_ids, retained.identity),
+          "a different frontier must not match");
+    PreparedPromptData rebased = lineage;
+    for (std::size_t i = 0; i < rebased.token_ids.size(); ++i) {
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            rebased.positions[axis * rebased.token_ids.size() + i] += 7;
+        }
+    }
+    ResidentPrefixIdentity rebased_identity;
+    rebased_identity.assign(rebased);
+    check(!checkpoint_boundary_matches(retained, RewriteCheckpointKind::ResponseReplay, 3,
+                                       rebased.token_ids, rebased_identity),
+          "a different position lineage must not match");
+    HostCheckpoint legacy;
+    legacy.kind     = RewriteCheckpointKind::ResponseReplay;
+    legacy.frontier = 3;
+    check(checkpoint_boundary_matches(legacy, RewriteCheckpointKind::ResponseReplay, 3,
+                                      lineage.token_ids, retained.identity),
+          "a retained entry without provenance must match on kind and frontier");
 
     // Erasing releases the bytes it accounted for.
     lru.erase(*first);

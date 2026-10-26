@@ -107,6 +107,28 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
+    if (!options.score_token_ids.empty()) {
+        // Scoring reads the prefill's target logits. Exactly one output token is required: zero
+        // never reaches prefill, and more than one lets MTP replace io.logits with its proposal
+        // head before the read (initial_mtp_extent is derived from effective_output_tokens).
+        if (options.requested_output_tokens != 1) {
+            throw std::invalid_argument(
+                "scoring requests require requested_output_tokens == 1");
+        }
+        if (options.score_token_ids.size() > 1024) {
+            throw std::invalid_argument("a scoring request may address at most 1024 token ids");
+        }
+        std::vector<TokenId> sorted = options.score_token_ids;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+            throw std::invalid_argument("scoring token ids must be unique");
+        }
+        for (const TokenId id : options.score_token_ids) {
+            if (id < 0 || id >= TextConfig::token_domain) {
+                throw std::invalid_argument("scoring token id is outside the token domain");
+            }
+        }
+    }
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -122,6 +144,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->prefill_only_scoring           = !options.score_token_ids.empty();
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -845,6 +868,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    // A prefill-only scoring request publishes no assistant text (its sampled token is discarded),
+    // so no later request can replay from the response header it would capture. Skipping that
+    // capture saves a device checkpoint write plus a host export per request.
+    const bool prefill_only_scoring = base.prefill_only_scoring;
     // A parked plan names the lane's *replaced* occupant only until the restore runs, so the
     // occupant's checkpoint says nothing about the conversation being resumed: never let it
     // authorize a retention the restored state cannot back. A historical plan likewise replaces
@@ -865,8 +892,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                               ? RewriteCheckpointAction::KeepExisting
                                               : RewriteCheckpointAction::ReclassifyExisting;
     } else if (desired->frontier > plan->reuse_base) {
-        plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
-        plan->rewrite_checkpoint_capture = desired;
+        if (prefill_only_scoring) {
+            plan->rewrite_checkpoint_action = RewriteCheckpointAction::SkipCapture;
+        } else {
+            plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
+            plan->rewrite_checkpoint_capture = desired;
+        }
     } else {
         // The selected continuation state is already past the desired boundary. It remains a
         // valid hit; do not replay an otherwise reusable prefix merely to materialize an older

@@ -169,6 +169,7 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/systemone` | TypeSafe/OpenJev typed decisions (choice/score/noul), model-independent |
 
 ## OpenAI Chat Completions
 
@@ -561,6 +562,61 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## TypeSafe / OpenJev decisions
+
+`POST /v1/systemone` answers typed questions about a `state` with the loaded model. It follows the
+[TypeSafe API](https://docs.typesafe.ai/api) shape but is model-independent: it needs no decision
+metadata, no fine-tuned decision model, and no change to the artifact. The server renders a generic
+"answer with the option letter" prompt through the artifact's own chat template, evaluates one
+prefill per question, and turns the next-token logits of the option labels into probabilities.
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {"billing": null, "shipping": null, "technical": null}
+      },
+      "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this?",
+        "criteria": ["can wait", "this week", "today", "right now"]
+      }
+    }
+  }'
+```
+
+Request fields:
+
+- `state` (required): a string, object, or array. Non-string values are sent as compact JSON. A state
+  made of chat messages may contain `image_url` data-URL parts; they are moved to the prompt's image
+  inputs in encounter order.
+- `files` / `images` (optional): arrays of data URLs (`data:image/...;base64,...`), at most 8 in total.
+  Images require `--vision`. Videos and audio are rejected.
+- `questions` (required): an object mapping ids to questions. `type` is `choice` (criteria is an
+  object of option keys), `score` (criteria is an array of 2 to 10 ordered levels), or `noul`
+  (optional criteria object with `true`/`false` descriptions).
+- `temperature` (optional, default `1.0`): softmax temperature over the option scores; values above 1
+  flatten the distribution.
+- `model` (optional): if present and non-empty it must equal the served model id.
+
+Answers have the reference shapes: `choice` returns `choice`, `probabilities`, and `confidence`;
+`score` returns `score` (expected level), `legend`, `probabilities`, and `confidence`; `noul` returns
+`noul` (the probability of true). `usage.input_tokens` counts every question's prompt tokens and
+`usage.output_tokens` is always 0.
+
+Limits are 64 questions per request, 52 options per question, and 2 to 10 score levels. Each
+question is an independent prefill. With `--boundary-checkpoints`, later questions restore the state
+message boundary instead of re-prefilling the state. The probabilities are the loaded model's
+label-token distribution; they are not calibrated and depend on the model following the letter
+instruction, so `temperature` is only a presentation knob. These internal per-question requests are
+summarized in one console line and do not appear in the structured request log.
 
 ## Authentication and CORS
 
