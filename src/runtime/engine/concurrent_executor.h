@@ -103,6 +103,12 @@ public:
         Submission(const Submission&)            = delete;
         Submission& operator=(const Submission&) = delete;
 
+        // Engine-local id assigned at submission. Survives until wait() consumes the request;
+        // 0 for a default-constructed handle or the zero-output immediate path.
+        [[nodiscard]] std::uint64_t request_id() const noexcept {
+            return request_ ? request_->id : 0;
+        }
+
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
                 throw std::logic_error("concurrent submission is empty");
@@ -262,8 +268,14 @@ private:
                 active != nullptr) {
                 snapshot.prefill_prompt_tokens    = active->prompt_summary.prompt_tokens;
                 snapshot.prefill_processed_tokens = active->prefill_processed_tokens;
+                snapshot.prefill_request_id       = active->id;
+                snapshot.prefill_vision_done =
+                    active->prefill_vision_done.load(std::memory_order_relaxed);
+                snapshot.prefill_vision_total =
+                    active->prefill_vision_total.load(std::memory_order_relaxed);
             }
         }
+        snapshot.kv_park = instance_.program->kv_park_stats();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -357,6 +369,10 @@ private:
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
+        // Vision encode progress of this request's prefill, written by the worker after each
+        // prefill step and read by the stats publisher.
+        std::atomic<std::uint32_t> prefill_vision_done{0};
+        std::atomic<std::uint32_t> prefill_vision_total{0};
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
         Clock::time_point deadline;
@@ -813,6 +829,9 @@ private:
         }
         const PrefillStepResult step =
             instance_.program->advance_prefill_lane(lane, prefill_step_tokens());
+        const auto vision                     = instance_.program->prefill_vision_progress(lane);
+        request->prefill_vision_done.store(vision.first, std::memory_order_relaxed);
+        request->prefill_vision_total.store(vision.second, std::memory_order_relaxed);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();

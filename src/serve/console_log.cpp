@@ -1,11 +1,14 @@
 #include "serve/console_log.h"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <string>
 
 namespace ninfer::serve {
 namespace {
@@ -25,6 +28,39 @@ const char* level_name(ConsoleLogLevel level) noexcept {
 std::mutex& console_mutex() {
     static std::mutex mutex;
     return mutex;
+}
+
+std::string& status_text() {
+    static std::string text;
+    return text;
+}
+
+bool& status_open() {
+    static bool open = false;
+    return open;
+}
+
+std::size_t& status_width() {
+    static std::size_t width = 0;
+    return width;
+}
+
+// Callers hold console_mutex().
+void erase_status_locked() {
+    if (!status_open()) { return; }
+    std::cerr << '\r' << std::string(status_width(), ' ') << '\r';
+    status_open() = false;
+}
+
+// Callers hold console_mutex().
+void draw_status_locked() {
+    if (status_text().empty()) {
+        status_width() = 0;
+        return;
+    }
+    std::cerr << '\r' << status_text();
+    status_width() = status_text().size();
+    status_open()  = true;
 }
 
 } // namespace
@@ -52,7 +88,27 @@ std::string current_console_log_prefix(ConsoleLogLevel level) {
 
 void write_console_log(ConsoleLogLevel level, std::string_view message) {
     std::lock_guard lock(console_mutex());
+    erase_status_locked();
     std::cerr << current_console_log_prefix(level) << message << '\n';
+    draw_status_locked();
+    std::cerr.flush();
+}
+
+void set_console_status_line(std::string_view line) {
+    if (::isatty(STDERR_FILENO) != 1) { return; }
+    std::lock_guard lock(console_mutex());
+    status_text().assign(line);
+    erase_status_locked();
+    draw_status_locked();
+    std::cerr.flush();
+}
+
+void clear_console_status_line() {
+    std::lock_guard lock(console_mutex());
+    erase_status_locked();
+    status_text().clear();
+    status_width() = 0;
+    std::cerr.flush();
 }
 
 } // namespace ninfer::serve

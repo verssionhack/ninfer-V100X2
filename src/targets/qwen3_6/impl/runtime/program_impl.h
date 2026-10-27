@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -239,6 +240,96 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
 } // namespace
 
+std::pair<std::uint32_t, std::uint32_t>
+ProgramImplCore::prefill_vision_progress(std::uint32_t lane) const noexcept {
+    if (lane >= requests.size() || !requests[lane].prefill) { return {0, 0}; }
+    const std::unique_ptr<schedule::VisionPrefillSession>& vision = requests[lane].prefill->vision;
+    if (!vision) { return {0, 0}; }
+    return {static_cast<std::uint32_t>(vision->items_encoded()),
+            static_cast<std::uint32_t>(vision->items_total())};
+}
+
+double ProgramImplCore::wall_now_seconds() noexcept {
+    return std::chrono::duration<double>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+double ProgramImplCore::parked_value_density(const ParkedSequence& entry) const noexcept {
+    if (!kv_park_value_policy || entry.execution_frontier == 0) { return 0.0; }
+    return estimate_park_value(entry, entry.execution_frontier, wall_now_seconds(),
+                               park_value_params_)
+        .density;
+}
+
+void ProgramImplCore::sample_prefill_rate(double tokens, double seconds) noexcept {
+    // A short prefill is dominated by fixed per-request startup (weights launch, first-token
+    // latency), not marginal token cost: a 36-token request that spends 1.7 s waiting measures
+    // 22 tok/s while the machine sustains >1k. Letting such a sample into the EWMA inflates the
+    // modeled cost of every token and makes any restore look profitable, so only rate-dominated
+    // samples are admitted. A suffix prefill after a restore is still sampled when it is long.
+    constexpr double kMinimumSampleTokens  = 1024.0;
+    constexpr double kMinimumSampleSeconds = 0.25;
+    if (!(tokens >= kMinimumSampleTokens) || !(seconds >= kMinimumSampleSeconds)) { return; }
+    const double sec_per_token = seconds / tokens;
+    if (!std::isfinite(sec_per_token) || sec_per_token <= 0.0) { return; }
+    kv_park_prefill_sec_per_token_ =
+        kv_park_prefill_sec_per_token_ <= 0.0
+            ? sec_per_token
+            : 0.2 * sec_per_token + 0.8 * kv_park_prefill_sec_per_token_;
+    if (!kv_park_prefill_rate_fixed_) {
+        park_value_params_.prefill_sec_per_token = kv_park_prefill_sec_per_token_;
+    }
+}
+
+void ProgramImplCore::sample_restore_rate(std::size_t bytes, double seconds) noexcept {
+    // Small images are dominated by open/seek latency rather than throughput, so a "fast" small
+    // read would teach the model an unattainable rate and make large restores look cheap.
+    constexpr std::size_t kMinimumSampleBytes = 64U << 20U;
+    constexpr double kMinimumSampleSeconds    = 0.05;
+    if (bytes < kMinimumSampleBytes || !(seconds >= kMinimumSampleSeconds)) { return; }
+    const double sec_per_byte = seconds / static_cast<double>(bytes);
+    if (!std::isfinite(sec_per_byte) || sec_per_byte <= 0.0) { return; }
+    kv_park_read_sec_per_byte_ =
+        kv_park_read_sec_per_byte_ <= 0.0
+            ? sec_per_byte
+            : 0.2 * sec_per_byte + 0.8 * kv_park_read_sec_per_byte_;
+    if (!kv_park_read_rate_fixed_) {
+        park_value_params_.restore_sec_per_byte = kv_park_read_sec_per_byte_;
+    }
+}
+
+void ProgramImplCore::park_maintenance() {
+    if (kv_park_value_sweep_sec == 0) { return; }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_park_maintenance_ < std::chrono::seconds(kv_park_value_sweep_sec)) { return; }
+    last_park_maintenance_ = now;
+    enforce_disk_budget();
+}
+
+KvParkStats ProgramImplCore::kv_park_stats() const noexcept {
+    KvParkStats stats;
+    stats.ram_bytes    = parked.used_bytes();
+    stats.ram_budget   = parked.budget_bytes();
+    stats.ram_entries  = static_cast<std::uint32_t>(parked.entry_count());
+    stats.disk_bytes   = disk_spilled_bytes;
+    stats.disk_budget  = park_spill_bytes != 0 ? park_spill_bytes : parked.budget_bytes();
+    stats.disk_entries = static_cast<std::uint32_t>(disk_entries.size());
+    for (const std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+        if (entry->pinned) { ++stats.pinned_entries; }
+    }
+    stats.spills          = park_spill_count_;
+    stats.spill_failures  = park_spill_failure_count_;
+    stats.restores_ram    = park_restore_ram_count_;
+    stats.restores_disk   = park_restore_disk_count_;
+    stats.evictions_lru   = park_evict_lru_count_;
+    stats.evictions_value = park_evict_value_count_;
+    stats.expired         = park_expired_count_;
+    stats.superseded      = park_superseded_count_;
+    stats.gate_declines   = park_gate_decline_count_;
+    return stats;
+}
+
 PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer_model,
                          const SequencePlanImpl& plan, int rank_in)
     : rank(rank_in), device(peer_device), model(peer_model), persistent(plan.persistent.bytes),
@@ -275,6 +366,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
       kv_park_io_bytes(plan.kv_park_io_bytes),
       kv_park_prefetch(plan.kv_park_prefetch),
       kv_park_max_age_sec(plan.kv_park_max_age_sec),
+      kv_park_value_policy(plan.kv_park_value_policy),
+      kv_park_value_sweep_sec(plan.kv_park_value_sweep_sec),
+      last_park_maintenance_(std::chrono::steady_clock::now()),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
@@ -306,6 +400,21 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                       : std::nullopt) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+    }
+    kv_park_prefill_rate_fixed_ = plan.kv_park_prefill_tok_s != 0;
+    kv_park_read_rate_fixed_    = plan.kv_park_read_bytes_per_sec != 0;
+    park_value_params_.prefill_sec_per_token =
+        kv_park_prefill_rate_fixed_ ? 1.0 / plan.kv_park_prefill_tok_s : 1.0 / 1000.0;
+    park_value_params_.restore_sec_per_byte =
+        kv_park_read_rate_fixed_
+            ? 1.0 / static_cast<double>(plan.kv_park_read_bytes_per_sec)
+            : 1.0 / 1.5e9;
+    park_value_params_.overhead_sec      = plan.kv_park_restore_overhead_ms / 1000.0;
+    park_value_params_.half_life_sec     = static_cast<double>(plan.kv_park_value_half_life_sec);
+    park_value_params_.gate_min_saving_sec = plan.kv_park_restore_min_saving_ms / 1000.0;
+    if (kv_park_value_policy) {
+        parked.set_value_scorer(
+            [this](const ParkedSequence& entry) { return parked_value_density(entry); });
     }
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
@@ -862,12 +971,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 // The admission gate guaranteed this image. The index entry may already be gone
                 // (an evictor released it while the load ran); then its charge was already
                 // returned and only the payload in hand remains.
-                loaded->id = target;
+                loaded->id                = target;
+                const ParkedSequence* meta = find_disk_entry(target);
+                if (meta != nullptr) {
+                    loaded->reuse_hits        = meta->reuse_hits;
+                    loaded->restore_count     = meta->restore_count;
+                    loaded->created_wall_sec  = meta->created_wall_sec;
+                    loaded->last_hit_wall_sec = meta->last_hit_wall_sec;
+                }
                 restore_parked_lane(sequence, *loaded, request_plan.text_kv_page_entitlement,
                                     request_plan.backend_kv_page_entitlement,
                                     request_plan.parked_checkpoint, request_plan.checkpoint_index,
                                     request_plan.restore_shared_prefix, request_plan.reuse_base);
-                const ParkedSequence* meta = find_disk_entry(target);
+                ++park_restore_disk_count_;
                 if (meta != nullptr) { release_disk_entry_charged(*meta); }
             } else {
                 // Defensive only: a ready image cannot disappear between the gate and this start
@@ -891,6 +1007,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                 request_plan.backend_kv_page_entitlement,
                                 request_plan.parked_checkpoint, request_plan.checkpoint_index,
                                 request_plan.restore_shared_prefix, request_plan.reuse_base);
+            ++park_restore_ram_count_;
             parked.erase(target);
         }
         // The plan keeps RestoreParkedKv: from here the lane is indistinguishable from an appended
@@ -1927,7 +2044,9 @@ void ProgramImplCore::persist_state() {
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (sequences[lane].retained) { (void)park_retained_lane(lane); }
     }
-    // Flush the RAM tier to disk so nothing dies with the process.
+    // Flush the RAM tier to disk so a restart can reuse it. Under the value policy an entry whose
+    // image could not repay its own load is deliberately dropped rather than written, so not every
+    // resident conversation survives the process.
     std::size_t written = 0;
     std::size_t failed  = 0;
     while (std::unique_ptr<ParkedSequence> entry = parked.remove_least_recently_used()) {
@@ -2007,6 +2126,9 @@ void ProgramImplCore::load_parked_spill_entries() {
                                              std::chrono::duration_cast<std::chrono::seconds>(
                                                  stamp.time_since_epoch())
                                                  .count());
+            // Sidecars written before v3 carry no creation time; the image mtime is the best
+            // available wall-clock stand-in for retention decay.
+            if (entry->created_wall_sec == 0) { entry->created_wall_sec = entry->last_used; }
             newest = std::max(newest, entry->last_used);
             disk_spilled_bytes += entry->bytes + sequence_metadata_bytes(*entry);
             disk_entries.push_back(std::move(entry));
@@ -2062,6 +2184,9 @@ void ProgramImplCore::load_parked_spill_entries() {
                                              std::chrono::duration_cast<std::chrono::seconds>(
                                                  stamp.time_since_epoch())
                                                  .count());
+            // Sidecars written before v3 carry no creation time; the image mtime is the best
+            // available wall-clock stand-in for retention decay.
+            if (entry->created_wall_sec == 0) { entry->created_wall_sec = entry->last_used; }
             newest = std::max(newest, entry->last_used);
             disk_spilled_bytes += entry->bytes + sequence_metadata_bytes(*entry);
             strip_sequence_payload(*entry);
@@ -2335,6 +2460,7 @@ void ProgramImplCore::prune_superseded_ram(const ParkedSequence& incoming,
     for (const std::uint64_t id : victims) {
         reuse_trace("parked_supersede ram id=%llu", static_cast<unsigned long long>(id));
         parked.erase(id);
+        ++park_superseded_count_;
     }
 }
 
@@ -2349,6 +2475,7 @@ void ProgramImplCore::prune_superseded_disk(const ParkedSequence& incoming,
             remove_sequence_files((*it)->disk_path);
             disk_spilled_bytes -= std::min(disk_spilled_bytes, static_cast<std::uint64_t>(bytes));
             it = disk_entries.erase(it);
+            ++park_superseded_count_;
             continue;
         }
         ++it;
@@ -2364,11 +2491,38 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
     try {
         std::error_code error;
         std::filesystem::create_directories(park_spill_dir, error);
-        if (error) { return entry; }
+        if (error) {
+            reuse_trace("park_spill_dir_failed dir=%s error=%s", park_spill_dir.c_str(),
+                        error.message().c_str());
+            return entry;
+        }
         const std::filesystem::path path =
             std::filesystem::path(park_spill_dir) /
             ("park-" + std::to_string(next_disk_entry) + ".img");
         charged = entry->bytes + sequence_metadata_bytes(*entry);
+        // A write that can never pay for its own restore is pure cost. This is the same payoff the
+        // restore gate uses, so the two decisions agree: if a request matching this image's full
+        // frontier would be declined, do not spend minutes writing it. The disk-budget case is the
+        // same waste under a different name -- an image larger than the whole directory is written
+        // and immediately evicted by enforce_disk_budget.
+        if (kv_park_value_policy && entry->execution_frontier != 0) {
+            const std::uint64_t disk_budget =
+                park_spill_bytes != 0 ? park_spill_bytes : parked.budget_bytes();
+            const double required = park_value_params_.gate_min_saving_sec > 0.0
+                                        ? park_value_params_.gate_min_saving_sec
+                                        : 0.0;
+            const ParkRestorePayoff payoff = estimate_restore_payoff(
+                *entry, entry->execution_frontier, park_value_params_);
+            const bool too_large = disk_budget != 0 && charged > disk_budget;
+            if (too_large || payoff.net_sec < required) {
+                reuse_trace("park_spill_skip path=%s net_ms=%.1f required_ms=%.1f charged=%llu "
+                            "budget=%llu too_large=%d",
+                            path.c_str(), payoff.net_sec * 1000.0, required * 1000.0,
+                            static_cast<unsigned long long>(charged),
+                            static_cast<unsigned long long>(disk_budget), too_large ? 1 : 0);
+                return entry;
+            }
+        }
         if (disk_io) {
             // The pending-byte budget caps the host RAM held by queued payloads. Parking is
             // best-effort, so when the writer cannot take this image, hand the entry back
@@ -2422,6 +2576,7 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
                 .charged = charged,
             });
             submitted = true;
+            ++park_spill_count_;
             enforce_disk_budget();
             reuse_trace("park_spill_async path=%s bytes=%llu pending_entries=1", path.c_str(),
                         static_cast<unsigned long long>(charged));
@@ -2439,15 +2594,20 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::spill_entry(
         strip_sequence_payload(*entry);
         disk_entries.push_back(std::move(entry));
         disk_spilled_bytes += charged;
+        ++park_spill_count_;
         reuse_trace("park_spill path=%s entries=%zu bytes=%llu", path.c_str(), disk_entries.size(),
                     static_cast<unsigned long long>(disk_spilled_bytes));
-        enforce_disk_budget();
+        // Value policy skips an oversized image before writing, so protecting the fresh copy here
+        // cannot hold the tier above its budget. Pure LRU keeps its historical byte-exact behavior:
+        // an entry that does not fit is its own eviction pass's victim.
+        enforce_disk_budget(kv_park_value_policy ? keep_id : 0);
         prune_superseded_disk(probe, protect_id, keep_id);
         return nullptr;
     } catch (const std::exception& error) {
         if (charged_pending) {
             disk_spilled_bytes -= std::min(disk_spilled_bytes, charged);
         }
+        ++park_spill_failure_count_;
         std::fprintf(stderr, "[reuse] park_spill FAILED: %s\n", error.what());
         // A submitted job is owned by the writer and cannot be returned. A synchronous failure
         // leaves an entry that still has its payload, so hand it back for the RAM tier -- but
@@ -2469,6 +2629,7 @@ void ProgramImplCore::drain_disk_completions() {
     for (DiskSpillCompletion& completion : done) {
         if (!completion.error.empty()) {
             disk_spilled_bytes -= std::min(disk_spilled_bytes, completion.charged);
+            ++park_spill_failure_count_;
             std::fprintf(stderr, "[reuse] park_spill FAILED (async): %s\n",
                          completion.error.c_str());
             continue;
@@ -2476,7 +2637,7 @@ void ProgramImplCore::drain_disk_completions() {
         strip_sequence_payload(*completion.entry);
         const std::uint64_t keep_id = completion.entry->id;
         disk_entries.push_back(std::move(completion.entry));
-        enforce_disk_budget();
+        enforce_disk_budget(kv_park_value_policy ? keep_id : 0);
         prune_superseded_disk(completion.probe, completion.protect_id, keep_id);
         reuse_trace("park_spill_done entries=%zu bytes=%llu", disk_entries.size(),
                     static_cast<unsigned long long>(disk_spilled_bytes));
@@ -2487,6 +2648,7 @@ void ProgramImplCore::pump_parked_io() {
     ++parked_io_tick_;
     drain_disk_completions();
     drain_parked_read_completions();
+    park_maintenance();
 }
 
 void ProgramImplCore::drain_parked_read_completions() {
@@ -2511,6 +2673,13 @@ void ProgramImplCore::drain_parked_read_completions() {
         completion.entry->id          = completion.id;
         completion.entry->disk_backed = false;
         completion.entry->disk_path.clear();
+        sample_restore_rate(completion.entry->bytes, completion.elapsed_seconds);
+        if (const ParkedSequence* meta = find_disk_entry(completion.id)) {
+            completion.entry->reuse_hits        = meta->reuse_hits;
+            completion.entry->restore_count     = meta->restore_count;
+            completion.entry->created_wall_sec  = meta->created_wall_sec;
+            completion.entry->last_hit_wall_sec = meta->last_hit_wall_sec;
+        }
         // The file was only needed for the read: the cached image stands on its own, and a
         // consumer that finds the index entry evicted treats its charge as already returned. The
         // entry becomes evictable again instead of staying pinned until another load displaces it.
@@ -2599,7 +2768,26 @@ std::unique_ptr<ParkedSequence> ProgramImplCore::take_parked_image(std::uint64_t
 }
 
 void ProgramImplCore::release_disk_entry_charged(const ParkedSequence& meta) noexcept {
-    if (meta.pinned) { return; }
+    if (meta.pinned) {
+        // A pinned shared-prefix image stays in the index, so record the restore in place. The
+        // sequence that consumed it carries its own increment through restore_parked_lane.
+        const double now = wall_now_seconds();
+        for (std::unique_ptr<ParkedSequence>& entry : disk_entries) {
+            if (entry->id != meta.id) { continue; }
+            if (entry->reuse_hits != std::numeric_limits<std::uint32_t>::max()) {
+                ++entry->reuse_hits;
+            }
+            if (entry->restore_count != std::numeric_limits<std::uint32_t>::max()) {
+                ++entry->restore_count;
+            }
+            if (entry->created_wall_sec == 0) {
+                entry->created_wall_sec = static_cast<std::uint64_t>(now);
+            }
+            entry->last_hit_wall_sec = static_cast<std::uint64_t>(now);
+            break;
+        }
+        return;
+    }
     const std::uint64_t id   = meta.id;
     const std::string path   = meta.disk_path;
     const std::size_t bytes  = meta.bytes + sequence_metadata_bytes(meta);
@@ -2713,9 +2901,11 @@ bool ProgramImplCore::parked_io_pending() const noexcept {
 }
 
 void ProgramImplCore::sweep_expired_disk_entries() {
-    if (kv_park_max_age_sec == 0 || disk_entries.empty()) { return; }
-    const auto now     = std::filesystem::file_time_type::clock::now();
-    const auto max_age = std::chrono::seconds(kv_park_max_age_sec);
+    const bool age_limit = kv_park_max_age_sec != 0;
+    if ((!age_limit && !kv_park_value_policy) || disk_entries.empty()) { return; }
+    const auto now      = std::filesystem::file_time_type::clock::now();
+    const auto max_age  = std::chrono::seconds(kv_park_max_age_sec);
+    const double now_wall = wall_now_seconds();
     for (auto it = disk_entries.begin(); it != disk_entries.end();) {
         // An entry an admission is loading (or about to load) must survive the sweep: the restore
         // is already committed to this lineage.
@@ -2723,19 +2913,51 @@ void ProgramImplCore::sweep_expired_disk_entries() {
             ++it;
             continue;
         }
-        std::error_code error;
-        const auto written = std::filesystem::last_write_time((*it)->disk_path, error);
-        if (error || now - written <= max_age) {
+        bool expire       = false;
+        const char* reason = "";
+        std::uint64_t age_seconds = 0;
+        double net_ms             = 0.0;
+        if (age_limit) {
+            std::error_code error;
+            const auto written = std::filesystem::last_write_time((*it)->disk_path, error);
+            if (error) {
+                ++it;
+                continue;
+            }
+            age_seconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(now - written).count());
+            if (now - written > max_age) {
+                expire = true;
+                reason = "age";
+            }
+        }
+        if (!expire && kv_park_value_policy && (*it)->execution_frontier != 0) {
+            const double reference = static_cast<double>(
+                std::max((*it)->created_wall_sec, (*it)->last_hit_wall_sec));
+            const double idle = reference > 0.0 ? std::max(0.0, now_wall - reference) : 0.0;
+            // Only retire an image after a full half-life of disuse: a fresh spill keeps its
+            // chance to be restored even if its expected saving is currently negative.
+            if (idle >= park_value_params_.half_life_sec) {
+                const ParkValue value = estimate_park_value(
+                    **it, (*it)->execution_frontier, now_wall, park_value_params_);
+                net_ms = value.net_sec * 1000.0;
+                if (value.net_sec <= 0.0) {
+                    expire = true;
+                    reason = "value";
+                }
+            }
+        }
+        if (!expire) {
             ++it;
             continue;
         }
-        reuse_trace("park_expire path=%s bytes=%zu age_s=%llu",
-                    (*it)->disk_path.c_str(), (*it)->bytes,
-                    static_cast<unsigned long long>(
-                        std::chrono::duration_cast<std::chrono::seconds>(now - written).count()));
+        reuse_trace("park_expire path=%s bytes=%zu reason=%s age_s=%llu net_ms=%.1f",
+                    (*it)->disk_path.c_str(), (*it)->bytes, reason,
+                    static_cast<unsigned long long>(age_seconds), net_ms);
         remove_sequence_files((*it)->disk_path);
         disk_spilled_bytes -= std::min<std::uint64_t>(
             disk_spilled_bytes, (*it)->bytes + sequence_metadata_bytes(**it));
+        ++park_expired_count_;
         it = disk_entries.erase(it);
     }
 }
@@ -2779,9 +3001,13 @@ void ProgramImplCore::prefetch_disk_entries() {
             continue;
         }
         if (entry == nullptr) { continue; }
-        entry->disk_backed = false;
+        entry->disk_backed       = false;
         entry->disk_path.clear();
-        entry->pinned = false;
+        entry->pinned            = false;
+        entry->reuse_hits        = meta->reuse_hits;
+        entry->restore_count     = meta->restore_count;
+        entry->created_wall_sec  = meta->created_wall_sec;
+        entry->last_hit_wall_sec = meta->last_hit_wall_sec;
         if (!parked.insert(std::move(entry), park_clock++, 0).has_value()) {
             // Does not fit the host budget; leave the disk entry untouched.
             continue;
@@ -2800,34 +3026,55 @@ void ProgramImplCore::prefetch_disk_entries() {
     }
 }
 
-void ProgramImplCore::enforce_disk_budget() {
-    // Drop long-idle images first, then apply the byte-budget LRU. Both are fixed policies: no
-    // entry is spared because it is old, and none is kept because it is large. Startup indexing
-    // defers the age sweep until after the MRU prefetch has taken its entries.
+void ProgramImplCore::enforce_disk_budget(std::uint64_t protect_id) {
+    // Drop long-idle images first, then apply the byte-budget policy. Under the value policy
+    // `protect_id` names the entry a caller just published: without it, a large fresh image can be
+    // its own eviction pass's victim when several smaller entries have better value density,
+    // writing then deleting gigabytes. The caller passes 0 under `--kv-park-lru` so the hard byte
+    // budget keeps its historical, byte-exact behavior.
+    // Startup indexing defers the age sweep until after the MRU prefetch has taken its entries.
     if (!disk_index_loading_) { sweep_expired_disk_entries(); }
     const std::uint64_t budget =
         park_spill_bytes != 0 ? park_spill_bytes : parked.budget_bytes();
     if (budget == 0) { return; }
     while (disk_spilled_bytes > budget) {
-        std::size_t oldest = disk_entries.size();
+        std::size_t victim        = disk_entries.size();
+        double victim_density     = std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < disk_entries.size(); ++i) {
-            if (disk_entries[i]->pinned ||
+            if (disk_entries[i]->id == protect_id || disk_entries[i]->pinned ||
                 parked_read_pins_.count(disk_entries[i]->id) != 0) {
                 continue;
             }
-            if (oldest == disk_entries.size() ||
-                disk_entries[i]->last_used < disk_entries[oldest]->last_used) {
-                oldest = i;
+            if (!kv_park_value_policy) {
+                if (victim == disk_entries.size() ||
+                    disk_entries[i]->last_used < disk_entries[victim]->last_used) {
+                    victim = i;
+                }
+                continue;
+            }
+            const double density = parked_value_density(*disk_entries[i]);
+            const double score   = std::isfinite(density) ? density : 0.0;
+            if (victim == disk_entries.size() || score < victim_density ||
+                (score == victim_density &&
+                 disk_entries[i]->last_used < disk_entries[victim]->last_used)) {
+                victim         = i;
+                victim_density = score;
             }
         }
-        if (oldest == disk_entries.size()) { break; }
-        reuse_trace("park_spill_evict path=%s bytes=%zu entries=%zu",
-                    disk_entries[oldest]->disk_path.c_str(), disk_entries[oldest]->bytes,
-                    disk_entries.size());
-        remove_sequence_files(disk_entries[oldest]->disk_path);
-        disk_spilled_bytes -= disk_entries[oldest]->bytes +
-                              sequence_metadata_bytes(*disk_entries[oldest]);
-        disk_entries.erase(disk_entries.begin() + static_cast<std::ptrdiff_t>(oldest));
+        if (victim == disk_entries.size()) { break; }
+        reuse_trace("park_spill_evict path=%s bytes=%zu entries=%zu policy=%s density=%.6g",
+                    disk_entries[victim]->disk_path.c_str(), disk_entries[victim]->bytes,
+                    disk_entries.size(), kv_park_value_policy ? "value" : "lru",
+                    kv_park_value_policy ? victim_density : 0.0);
+        remove_sequence_files(disk_entries[victim]->disk_path);
+        disk_spilled_bytes -= disk_entries[victim]->bytes +
+                              sequence_metadata_bytes(*disk_entries[victim]);
+        if (kv_park_value_policy) {
+            ++park_evict_value_count_;
+        } else {
+            ++park_evict_lru_count_;
+        }
+        disk_entries.erase(disk_entries.begin() + static_cast<std::ptrdiff_t>(victim));
     }
 }
 
@@ -2840,6 +3087,7 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
     std::vector<PagedKVPool*> backend_pools;
     storage_pools(text_pools, backend_pools);
     std::unique_ptr<ParkedSequence> loaded;
+    const auto read_started = std::chrono::steady_clock::now();
     try {
         loaded = read_sequence_image(meta.disk_path, image_geometry(), text_pools, backend_pools);
     } catch (...) {
@@ -2849,9 +3097,17 @@ void ProgramImplCore::restore_disk_entry(SequenceState& sequence, const ParkedSe
         drop_disk_entry_failed(meta.id, meta.pinned);
         throw;
     }
-    loaded->id = meta.id;
+    sample_restore_rate(
+        loaded->bytes,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - read_started).count());
+    loaded->id                = meta.id;
+    loaded->reuse_hits        = meta.reuse_hits;
+    loaded->restore_count     = meta.restore_count;
+    loaded->created_wall_sec  = meta.created_wall_sec;
+    loaded->last_hit_wall_sec = meta.last_hit_wall_sec;
     restore_parked_lane(sequence, *loaded, text_pages, backend_pages, plan.parked_checkpoint,
                         plan.checkpoint_index, plan.restore_shared_prefix, plan.reuse_base);
+    ++park_restore_disk_count_;
     release_disk_entry_charged(meta);
 }
 
@@ -2952,6 +3208,12 @@ bool ProgramImplCore::park_retained_lane(std::uint32_t lane, std::uint64_t prote
         entry->rope_delta         = sequence.rope_delta;
         entry->tail_hidden_valid  = sequence.tail_hidden_valid;
         entry->mtp_draft_count    = sequence.mtp_draft_count;
+        entry->reuse_hits         = sequence.reuse_hits;
+        entry->restore_count      = sequence.restore_count;
+        entry->last_hit_wall_sec  = sequence.last_hit_wall_sec;
+        entry->created_wall_sec   = sequence.created_wall_sec != 0
+                                        ? sequence.created_wall_sec
+                                        : static_cast<std::uint64_t>(wall_now_seconds());
         take(entry->mtp_drafts, sequence.mtp_drafts);
         if (checkpoint) {
             entry->checkpoint_valid    = true;
@@ -3155,6 +3417,12 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
+    // A cleared lane starts a new conversation; restore_parked_lane re-seeds these when the next
+    // request resumes a parked one.
+    sequence.reuse_hits        = 0;
+    sequence.restore_count     = 0;
+    sequence.created_wall_sec  = 0;
+    sequence.last_hit_wall_sec = 0;
     sequence.rewrite_checkpoint      = {};
     sequence.checkpoint_ledger.clear();
     sequence.checkpoint_identity.clear();
@@ -3664,6 +3932,19 @@ void ProgramImplCore::restore_parked_lane(SequenceState& sequence, ParkedSequenc
                                           SharedPrefixSlot resume_at_shared_prefix,
                                           std::uint32_t resume_frontier) {
     if (sequence.kv) { throw std::logic_error("parked restore requires an empty lane"); }
+    // Carry the conversation's usage history across the park/restore cycle. Counters saturate
+    // rather than wrap; wall time is the only clock the retention policy may compare against.
+    sequence.reuse_hits =
+        entry.reuse_hits == std::numeric_limits<std::uint32_t>::max() ? entry.reuse_hits
+                                                                      : entry.reuse_hits + 1;
+    sequence.restore_count =
+        entry.restore_count == std::numeric_limits<std::uint32_t>::max() ? entry.restore_count
+                                                                         : entry.restore_count + 1;
+    const double now = wall_now_seconds();
+    sequence.created_wall_sec  = entry.created_wall_sec != 0
+                                     ? entry.created_wall_sec
+                                     : static_cast<std::uint64_t>(now);
+    sequence.last_hit_wall_sec = static_cast<std::uint64_t>(now);
     const bool has_backend = backend_kv_cache() != nullptr;
     if (entry.text.size() != static_cast<std::size_t>(device_count) ||
         entry.linear_state.size() != entry.text.size() ||
@@ -5248,6 +5529,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.tail_hidden_valid      = true;
         request.timings.vision_seconds  = vision_seconds;
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        sample_prefill_rate(
+            staged.prompt_tokens > staged.base
+                ? static_cast<double>(staged.prompt_tokens - staged.base)
+                : 0.0,
+            request.timings.prefill_seconds);
         if (rewrite_checkpoint_capture) {
             const std::uint32_t frontier = rewrite_checkpoint_capture->frontier;
             if (frontier == 0 || frontier > prompt_tokens || sequence.text_kv_valid < frontier) {

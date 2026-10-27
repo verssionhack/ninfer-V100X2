@@ -4,6 +4,7 @@
 #include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
+#include "serve/status_line.h"
 
 #include <httplib.h>
 
@@ -77,6 +78,7 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    std::unique_ptr<StatusLineReporter> status_line_;
 };
 
 } // namespace ninfer::serve

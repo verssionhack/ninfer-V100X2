@@ -642,9 +642,32 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->reuse == ReusePath::ShareLanePrefix && candidate != nullptr &&
             candidate_frontier >= kMinimumParkedReuseTokens &&
             candidate_frontier + kShareParkedTolerance >= resident_base;
-        const bool worth_restoring =
+        bool worth_restoring =
             candidate != nullptr && candidate_frontier >= kMinimumParkedReuseTokens &&
             (candidate_frontier >= resident_base + kMinimumParkedReuseGain || parked_over_share);
+        // Cost gate: a disk image is read in full, so a shallow match after a client compacts its
+        // transcript must not pay gigabytes for a few thousand reused tokens. RAM entries skip it
+        // (their restore is a host copy), as do pinned shared-prefix images. A declined entry keeps
+        // its file and its place in the index for a future, deeper match.
+        if (worth_restoring && candidate != nullptr && kv_park_value_policy &&
+            is_disk_entry_id(candidate->id) && !candidate->pinned &&
+            park_value_params_.gate_min_saving_sec > 0.0) {
+            const std::uint32_t saved =
+                candidate_frontier > resident_base ? candidate_frontier - resident_base : 0;
+            ParkRestorePayoff payoff;
+            const bool passes = park_restore_passes_gate(*candidate, saved, park_value_params_,
+                                                         &payoff);
+            reuse_trace("parked_gate%s id=%llu saved=%u bytes=%zu save_ms=%.1f load_ms=%.1f "
+                        "net_ms=%.1f required_ms=%.1f",
+                        passes ? "_pass" : "_decline",
+                        static_cast<unsigned long long>(candidate->id), saved, candidate->bytes,
+                        payoff.save_sec * 1000.0, payoff.restore_sec * 1000.0,
+                        payoff.net_sec * 1000.0, park_value_params_.gate_min_saving_sec * 1000.0);
+            if (!passes) {
+                ++park_gate_decline_count_;
+                worth_restoring = false;
+            }
+        }
         if (!worth_restoring && candidate != nullptr) {
             reuse_trace("parked declined frontier=%u resident=%u share=%d", candidate_frontier,
                         resident_base, plan->reuse == ReusePath::ShareLanePrefix ? 1 : 0);

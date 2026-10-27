@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/park_value.h"
 #include "targets/qwen3_6/impl/runtime/parked_disk_io.h"
 #include "targets/qwen3_6/impl/runtime/parked_sequence_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -19,14 +20,15 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <set>
-#include <string>
-#include <array>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -218,6 +220,12 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    // Conversation usage carried across park/restore cycles for retention scoring. Wall-clock
+    // seconds; zero means unset (the next park fills them in). See ParkedSequence.
+    std::uint32_t reuse_hits        = 0;
+    std::uint32_t restore_count     = 0;
+    std::uint64_t created_wall_sec  = 0;
+    std::uint64_t last_hit_wall_sec = 0;
     RewriteCheckpoint rewrite_checkpoint;
     // Token/position lineage the current device checkpoint was captured from. Selection and
     // rotation must use this, not the lane's live ledger, which may have moved to another branch.
@@ -529,6 +537,16 @@ public:
     const std::uint64_t kv_park_io_bytes;
     const std::uint32_t kv_park_prefetch;
     const std::uint64_t kv_park_max_age_sec;
+    // Value-based retention. The params carry the seeded rates; the EWMAs replace them as real
+    // samples arrive unless the corresponding flag pinned a value.
+    const bool kv_park_value_policy;
+    const std::uint32_t kv_park_value_sweep_sec;
+    ParkValueParams park_value_params_;
+    bool kv_park_prefill_rate_fixed_ = false;
+    bool kv_park_read_rate_fixed_    = false;
+    double kv_park_prefill_sec_per_token_ = 0.0; // EWMA state; 0 = no sample yet
+    double kv_park_read_sec_per_byte_     = 0.0;
+    std::chrono::steady_clock::time_point last_park_maintenance_;
     // Background FIFO spill writer; null when spill I/O is synchronous or no directory is set.
     std::unique_ptr<ParkedDiskIo> disk_io;
     // Background FIFO reader for disk-backed restores; null when `kv_park_io_bytes` is zero (the
@@ -616,6 +634,17 @@ public:
     // targets a parked entry. Only relative order matters, so any monotone counter will do.
     std::uint64_t park_clock = 0;
 
+    // Cumulative park/spill counters exposed through RuntimeStats::kv_park.
+    std::uint64_t park_spill_count_          = 0;
+    std::uint64_t park_spill_failure_count_  = 0;
+    std::uint64_t park_restore_ram_count_    = 0;
+    std::uint64_t park_restore_disk_count_   = 0;
+    std::uint64_t park_evict_lru_count_      = 0;
+    std::uint64_t park_evict_value_count_    = 0;
+    std::uint64_t park_expired_count_        = 0;
+    std::uint64_t park_superseded_count_     = 0;
+    std::uint64_t park_gate_decline_count_   = 0;
+
     // See logits_capture's comment. Read-only; the caller owns thread-safety (single-lane, read
     // after wait() returns). Empty while capture is disabled.
     [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept {
@@ -642,7 +671,23 @@ public:
         return peer_egress_mismatches;
     }
 
+    // Vision items encoded so far and the total for the request owning `lane`'s prefill. Both 0
+    // for a text-only prompt. Worker-only: the executor calls this from the prefill step it just
+    // ran, then publishes the result through RuntimeStats.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+    prefill_vision_progress(std::uint32_t lane) const noexcept;
+    // Gauges and cumulative counters for the parked/spilled tiers. Worker-owned; published into
+    // RuntimeStats under the executor's stats mutex.
+    [[nodiscard]] KvParkStats kv_park_stats() const noexcept;
+
 private:
+    // Retention scoring helpers. Worker-only; all wall-clock time used by the policy is read here.
+    [[nodiscard]] static double wall_now_seconds() noexcept;
+    [[nodiscard]] double parked_value_density(const ParkedSequence& entry) const noexcept;
+    void sample_prefill_rate(double tokens, double seconds) noexcept;
+    void sample_restore_rate(std::size_t bytes, double seconds) noexcept;
+    void park_maintenance();
+
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
@@ -712,6 +757,9 @@ private:
     [[nodiscard]] std::vector<const ParkedSequence*> parked_candidates() const;
     [[nodiscard]] const ParkedSequence* find_disk_entry(std::uint64_t id) const noexcept;
     static bool is_disk_entry_id(std::uint64_t id) noexcept;
+    // Applies the disk age sweep and byte-budget eviction. `protect_id` names an entry the caller
+    // just published; it is never its own enforcement pass's victim (write-then-evict churn).
+    void enforce_disk_budget(std::uint64_t protect_id = 0);
     void load_shared_prefix_entries();
     // Reloads conversations spilled by an earlier process from their metadata sidecars.
     void load_parked_spill_entries();
@@ -767,7 +815,6 @@ private:
     // would otherwise supersede itself and be deleted on the spot.
     void prune_superseded_disk(const ParkedSequence& incoming, std::uint64_t protect_id,
                                std::uint64_t keep_id = 0);
-    void enforce_disk_budget();
     void restore_disk_entry(SequenceState& sequence, const ParkedSequence& meta,
                             std::uint32_t text_pages, std::uint32_t backend_pages,
                             const RequestPlanImpl& plan);

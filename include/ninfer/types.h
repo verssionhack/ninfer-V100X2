@@ -183,6 +183,19 @@ struct EngineOptions {
     // for this many seconds. The byte budget already evicts least-recently-used entries when it
     // is exceeded; this additionally removes long-idle leftovers below that budget. 0 disables.
     std::uint64_t kv_park_max_age_sec = 0;
+    // Value-based retention for spilled conversations. When enabled (the default), the disk tier
+    // evicts the entry with the lowest estimated value density instead of the least-recently-used
+    // one, and a restore whose expected saving is below the threshold is declined. Disable with
+    // `kv_park_value_policy = false` to restore pure LRU behavior.
+    bool kv_park_value_policy                   = true;
+    std::uint32_t kv_park_restore_min_saving_ms = 750;
+    std::uint64_t kv_park_value_half_life_sec   = 1800;
+    // 0 means "measure" for both rates; the fallbacks are 1000 tokens/s and 1.5 GB/s.
+    std::uint32_t kv_park_prefill_tok_s      = 0;
+    std::uint64_t kv_park_read_bytes_per_sec = 0;
+    std::uint32_t kv_park_restore_overhead_ms = 250;
+    // Periodic value sweep interval on the worker; 0 sweeps only when a spill occurs.
+    std::uint32_t kv_park_value_sweep_sec = 60;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -435,6 +448,9 @@ private:
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+    // Stable FNV-1a-64 over the prepared token ids. It lets an operator correlate a live
+    // request with the same prompt submitted under a different HTTP id; 0 means unavailable.
+    std::uint64_t prompt_fingerprint = 0;
 };
 
 struct PromptPreparationStats {
@@ -508,11 +524,20 @@ private:
     std::function<bool()> requested_;
 };
 
+// Host-side preparation stages a caller can observe. Acquire covers fetching media bytes (path,
+// URL, or inline payload); Preprocess covers decode/resize/patch packing into a prepared payload.
+enum class PreparationStage : std::uint8_t {
+    Acquire,
+    Preprocess,
+};
+
 // Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
-// unbounded preparation.
+// unbounded preparation. `progress` is optional and runs on the preparing thread; it must not
+// block or re-enter the engine.
 struct PreparationControl {
     std::chrono::steady_clock::time_point deadline;
     CancellationView cancellation;
+    std::function<void(PreparationStage, std::size_t, std::size_t)> progress;
 };
 
 struct GenerationTimings {
@@ -632,6 +657,28 @@ struct DeviceMemoryReport {
     std::uint64_t total_bytes               = 0;
 };
 
+// Gauges and cumulative counters for the parked/spilled conversation tiers. Gauges are read from
+// the worker's published snapshot; cumulative counters only move forward, so a reader may
+// difference them.
+struct KvParkStats {
+    std::uint64_t ram_bytes     = 0;
+    std::uint64_t ram_budget    = 0;
+    std::uint64_t disk_bytes    = 0;
+    std::uint64_t disk_budget   = 0;
+    std::uint32_t ram_entries   = 0;
+    std::uint32_t disk_entries  = 0;
+    std::uint32_t pinned_entries = 0;
+    std::uint64_t spills          = 0;
+    std::uint64_t spill_failures  = 0;
+    std::uint64_t restores_ram    = 0;
+    std::uint64_t restores_disk   = 0;
+    std::uint64_t evictions_lru   = 0;
+    std::uint64_t evictions_value = 0;
+    std::uint64_t expired         = 0;
+    std::uint64_t superseded      = 0;
+    std::uint64_t gate_declines   = 0;
+};
+
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
 // interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
 struct RuntimeStats {
@@ -660,6 +707,15 @@ struct RuntimeStats {
     // not equality.
     std::uint32_t prefill_prompt_tokens    = 0;
     std::uint32_t prefill_processed_tokens = 0;
+    // Engine-local id of the request on the prefill lane, so a status reader can name it. Zero
+    // when no prefill is in flight.
+    std::uint64_t prefill_request_id = 0;
+    // Vision items encoded so far by that request's prefill session, and its total encoded
+    // items. Both are zero for a text-only prompt.
+    std::uint32_t prefill_vision_done  = 0;
+    std::uint32_t prefill_vision_total = 0;
+    // Parked/spilled conversation tier gauges and cumulative counters.
+    KvParkStats kv_park;
 };
 
 struct LoadSummary {

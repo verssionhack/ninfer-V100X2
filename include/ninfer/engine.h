@@ -51,6 +51,9 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept;
+    // Engine-local submission id, for correlating live progress with a request. Zero for an empty
+    // handle or a request that never entered the executor (zero requested output tokens).
+    [[nodiscard]] std::uint64_t request_id() const noexcept;
 
     GenerationResult wait(OutputSink* sink = nullptr, const CancellationView& cancellation = {});
 

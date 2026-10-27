@@ -13,6 +13,7 @@
 #include "targets/qwen3_6/impl/runtime/sequence_image_io.h"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -50,6 +51,8 @@ struct DiskReadCompletion {
     std::uint64_t id = 0;
     std::string path;
     std::uint64_t charged = 0;
+    // Wall time of the image read, used to seed the restore-cost estimate.
+    double elapsed_seconds = 0.0;
     std::unique_ptr<ParkedSequence> entry;
     std::string error;
 };
@@ -298,12 +301,16 @@ private:
             completion.id      = job.id;
             completion.path    = job.path;
             completion.charged = job.charged;
+            const auto read_started = std::chrono::steady_clock::now();
             try {
                 completion.entry = read_sequence_image(job.path, job.geometry, job.text_pools,
                                                        job.backend_pools);
             } catch (const std::exception& error) {
                 completion.error = error.what();
             }
+            completion.elapsed_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - read_started)
+                    .count();
 
             {
                 std::lock_guard lock(state->mutex);

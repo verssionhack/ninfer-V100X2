@@ -775,7 +775,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         }
     }
     MediaCacheRequestStats cache_stats;
-    std::size_t patch_cursor = 0;
+    std::size_t patch_cursor      = 0;
+    std::size_t preprocessed_items = 0;
     for (PendingMedia& pending : pending_items) {
         PreparedMedia media;
         try {
@@ -793,6 +794,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             continue;
         }
         if (preparation_error) { continue; }
+        ++preprocessed_items;
+        if (control.progress) {
+            control.progress(PreparationStage::Preprocess, preprocessed_items, parts.size());
+        }
         if (!media.payload || media.payload->patch_elements % kPatchFeatures != 0) {
             preparation_error = std::make_exception_ptr(
                 std::logic_error("preprocessed patch buffer is not row aligned"));

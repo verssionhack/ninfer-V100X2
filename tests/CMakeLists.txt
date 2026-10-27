@@ -337,6 +337,17 @@ ninfer_add_test(ninfer_parked_sequence_store_test
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_parked_sequence_store_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+# Host-only: the spilled-conversation cost model shared by eviction order and the restore gate.
+ninfer_add_test(ninfer_park_value_test
+  SOURCES test_park_value.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_park_value_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+# Host-only: the operator status-line formatter (request identity, prefill/media progress, park
+# gauges) and fingerprint rendering.
+ninfer_add_test(ninfer_status_line_test
+  SOURCES test_status_line.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)

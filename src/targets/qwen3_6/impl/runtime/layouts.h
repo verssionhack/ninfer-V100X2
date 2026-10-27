@@ -104,6 +104,13 @@ struct SequencePlanningInputs {
     std::uint64_t kv_park_io_bytes = 0;
     std::uint32_t kv_park_prefetch = 0;
     std::uint64_t kv_park_max_age_sec = 0;
+    bool kv_park_value_policy                   = true;
+    std::uint32_t kv_park_restore_min_saving_ms = 750;
+    std::uint64_t kv_park_value_half_life_sec   = 1800;
+    std::uint32_t kv_park_prefill_tok_s         = 0;
+    std::uint64_t kv_park_read_bytes_per_sec    = 0;
+    std::uint32_t kv_park_restore_overhead_ms   = 250;
+    std::uint32_t kv_park_value_sweep_sec       = 60;
     bool volta_long_attention = false;
 };
 
@@ -147,6 +154,13 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t kv_park_io_bytes = 0;
     std::uint32_t kv_park_prefetch = 0;
     std::uint64_t kv_park_max_age_sec = 0;
+    bool kv_park_value_policy                   = true;
+    std::uint32_t kv_park_restore_min_saving_ms = 750;
+    std::uint64_t kv_park_value_half_life_sec   = 1800;
+    std::uint32_t kv_park_prefill_tok_s         = 0;
+    std::uint64_t kv_park_read_bytes_per_sec    = 0;
+    std::uint32_t kv_park_restore_overhead_ms   = 250;
+    std::uint32_t kv_park_value_sweep_sec       = 60;
     bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

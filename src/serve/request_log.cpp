@@ -182,6 +182,9 @@ Json request_json(const RequestLogContext& context) {
                 {"enable_thinking", context.enable_thinking},
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                {"prompt_fingerprint",
+                 context.fingerprint != 0 ? format_fingerprint(context.fingerprint, 16)
+                                          : std::string()},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -318,6 +321,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.sampling                           = prepared.sampling;
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
+    context.fingerprint                        = prepared.fingerprint;
     return context;
 }
 
@@ -343,7 +347,11 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
 
 std::string format_request_start(const RequestLogContext& context) {
     std::ostringstream out;
-    out << "[req " << context.id << "] " << context.protocol << ' '
+    out << "[req " << context.id;
+    if (context.fingerprint != 0) {
+        out << " fp=" << format_fingerprint(context.fingerprint, 16);
+    }
+    out << "] " << context.protocol << ' '
         << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
         << " max_tokens=" << context.requested_output_tokens << ' '
         << (context.requested_output_tokens_client_set ? "(client)" : "(server default)")

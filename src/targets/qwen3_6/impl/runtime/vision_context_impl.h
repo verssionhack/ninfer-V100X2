@@ -440,6 +440,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             swap_.restore(swap_.self);
         }
         timers_.back().record_stop();
+        ++items_encoded_;
         active_item_ = active->item_index;
         encoded_payloads_pending_release_.push_back(active->item_index);
     }

@@ -43,6 +43,8 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    // FNV-1a-64 over the prepared token ids; 0 when preparation failed before tokenization.
+    std::uint64_t fingerprint = 0;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "ninfer/engine.h"
+#include "serve/live_status.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -86,6 +87,9 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    // Engine-local submission id and prepared-token fingerprint, for live status and logs.
+    std::uint64_t engine_id   = 0;
+    std::uint64_t fingerprint = 0;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 
@@ -101,6 +105,8 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] std::shared_ptr<LiveRequestRegistry> live_status() const { return live_; }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
@@ -109,8 +115,10 @@ public:
         return engine_->sampling_defaults();
     }
 
+    // `live_id` is the HTTP request id used for status reporting; 0 disables live bookkeeping.
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+                                          std::function<bool()> is_cancelled = {},
+                                          std::uint64_t live_id               = 0) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -125,6 +133,7 @@ private:
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::shared_ptr<LiveRequestRegistry> live_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

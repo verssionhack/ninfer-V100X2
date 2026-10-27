@@ -423,8 +423,9 @@ inline std::vector<std::unique_ptr<ParkedSequence>> read_sequence_images(
 // reading the payloads. Written after the image, removed with it.
 
 inline constexpr std::uint32_t kSequenceMetaMagic   = 0x314d514eU;  // 'NQM1'
-// v2 adds the pinned resume anchor; v1 sidecars remain readable.
-inline constexpr std::uint32_t kSequenceMetaVersion = 2U;
+// v2 adds the pinned resume anchor; v3 adds retention usage (hits, restores, wall timestamps).
+// Older sidecars remain readable and default the new fields to zero.
+inline constexpr std::uint32_t kSequenceMetaVersion = 3U;
 
 namespace sequence_image_io_detail {
 
@@ -523,6 +524,10 @@ inline void write_sequence_metadata(const ParkedSequence& entry, std::size_t pay
         if (entry.resume_anchor.frontier != 0) {
             sequence_image_io_detail::write_meta_checkpoint(out, entry.resume_anchor);
         }
+        put_scalar<std::uint32_t>(out, entry.reuse_hits);
+        put_scalar<std::uint32_t>(out, entry.restore_count);
+        put_scalar<std::uint64_t>(out, entry.created_wall_sec);
+        put_scalar<std::uint64_t>(out, entry.last_hit_wall_sec);
         out.flush();
         if (!out) {
             throw std::runtime_error("sequence metadata write failed: " + path);
@@ -599,6 +604,12 @@ inline std::unique_ptr<ParkedSequence> read_sequence_metadata(
     }
     if (meta_version >= 2 && get_scalar<std::uint8_t>(in) != 0) {
         sequence_image_io_detail::read_meta_checkpoint(in, entry->resume_anchor);
+    }
+    if (meta_version >= 3) {
+        entry->reuse_hits        = get_scalar<std::uint32_t>(in);
+        entry->restore_count     = get_scalar<std::uint32_t>(in);
+        entry->created_wall_sec  = get_scalar<std::uint64_t>(in);
+        entry->last_hit_wall_sec = get_scalar<std::uint64_t>(in);
     }
     if (in.peek() != std::char_traits<char>::eof()) {
         throw std::runtime_error("sequence metadata has trailing data: " + path);

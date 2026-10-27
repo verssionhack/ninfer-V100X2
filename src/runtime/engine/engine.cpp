@@ -151,6 +151,7 @@ public:
     public:
         virtual ~Concept() = default;
         virtual GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) = 0;
+        virtual std::uint64_t request_id() const noexcept                                    = 0;
     };
 
     template <class Submission>
@@ -162,6 +163,8 @@ public:
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
         }
+
+        std::uint64_t request_id() const noexcept override { return submission_.request_id(); }
 
     private:
         std::shared_ptr<void> keep_alive_;
@@ -177,6 +180,8 @@ public:
     GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
         return state_->wait(sink, cancellation);
     }
+
+    [[nodiscard]] std::uint64_t request_id() const noexcept { return state_->request_id(); }
 
     [[nodiscard]] const ResolvedSamplingParameters& resolved_sampling() const noexcept {
         return sampling_;
@@ -195,6 +200,10 @@ GenerationHandle& GenerationHandle::operator=(GenerationHandle&&) noexcept = def
 GenerationHandle::GenerationHandle(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 GenerationHandle::operator bool() const noexcept { return impl_ != nullptr; }
+
+std::uint64_t GenerationHandle::request_id() const noexcept {
+    return impl_ != nullptr ? impl_->request_id() : 0;
+}
 
 const ResolvedSamplingParameters& GenerationHandle::resolved_sampling() const noexcept {
     static const ResolvedSamplingParameters empty;
@@ -354,6 +363,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                 if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
                 return std::move(result);
             }
+
+            [[nodiscard]] std::uint64_t request_id() const noexcept { return 0; }
         } immediate;
 
         immediate.result.prompt                  = prompt_summary;

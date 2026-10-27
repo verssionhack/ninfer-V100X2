@@ -290,6 +290,22 @@ fi::ChatRenderOptions render_options(const PromptOptions& options, bool boundary
                                  .tool_jsons            = options.tool_jsons};
 }
 
+// FNV-1a-64 over the prepared token ids. This is stable across protocols that render the same
+// conversation and matches the token stream the prefix matcher sees.
+std::uint64_t prompt_fingerprint(std::span<const TokenId> tokens) noexcept {
+    constexpr std::uint64_t kOffsetBasis = 14695981039346656037ULL;
+    constexpr std::uint64_t kPrime       = 1099511628211ULL;
+    std::uint64_t hash                   = kOffsetBasis;
+    for (const TokenId token : tokens) {
+        std::uint32_t value = static_cast<std::uint32_t>(token);
+        for (int shift = 0; shift < 32; shift += 8) {
+            hash ^= static_cast<std::uint64_t>((value >> shift) & 0xFFU);
+            hash *= kPrime;
+        }
+    }
+    return hash;
+}
+
 std::uint32_t checked_token_count(std::size_t count) {
     if (count == 0) {
         throw std::invalid_argument("prepared prompt must contain at least one token");
@@ -729,8 +745,9 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.prompt_tokens = checked_token_count(data_->token_ids.size()),
-                         .has_media     = data_->has_media()};
+    return PromptSummary{.prompt_tokens      = checked_token_count(data_->token_ids.size()),
+                         .has_media          = data_->has_media(),
+                         .prompt_fingerprint = prompt_fingerprint(data_->token_ids)};
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {

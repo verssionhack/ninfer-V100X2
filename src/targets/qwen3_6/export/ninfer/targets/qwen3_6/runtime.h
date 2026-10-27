@@ -199,6 +199,11 @@ public:
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     // Borrowed worker-owned counters; valid until the next mutation of this lane.
     [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
+    // Live prefill progress for the status line: vision items encoded/needed by the lane.
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+    prefill_vision_progress(std::uint32_t lane) const noexcept;
+    // Gauges and cumulative counters for the parked/spilled tiers.
+    [[nodiscard]] KvParkStats kv_park_stats() const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

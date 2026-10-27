@@ -634,6 +634,15 @@ client-side override.
 | `--kv-park-io-bytes N` | payload bytes queued to the background spill writer and restore reader; `0` = synchronous | `8 GiB` |
 | `--kv-park-prefetch N` | startup MRU prefetch of spilled conversations into RAM | `0` |
 | `--kv-park-max-age-sec N` | delete spill images idle longer than N seconds; `0` disables | `0` |
+| `--kv-park-lru` | use pure least-recently-used spill eviction instead of the cost/value rule | off |
+| `--kv-park-restore-min-saving-ms N` | decline a disk restore whose estimated net saving is below N ms; `0` disables the gate | `750` |
+| `--kv-park-value-half-life-sec N` | idle half-life of an entry's estimated return probability | `1800` |
+| `--kv-park-prefill-tok-s N` | prefill rate used by the value estimate; `0` measures it and falls back to `1000` | `0` |
+| `--kv-park-read-bytes-per-sec N` | disk read rate used by the value estimate; `0` measures it and falls back to `1500000000` | `0` |
+| `--kv-park-restore-overhead-ms N` | fixed staging/scheduling cost charged to a restore | `250` |
+| `--kv-park-value-sweep-sec N` | periodic value sweep on the engine worker; `0` sweeps only when spilling | `60` |
+| `--status-line` | draw one live progress/status line on stderr; non-terminal stderr gets terminated log lines instead | off |
+| `--status-line-interval-ms N` | refresh interval for the status line (`100..60000`) | `500` |
 | `--vision-max-tokens N\|unlimited` | merged visual-token limit per prompt and its device reservations; `unlimited`/`none`/`0` removes the limit (needs `--vision-kv-swap` or `--vision-device cpu`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -895,8 +904,52 @@ the reader and can wait for one image load. `--kv-park-prefetch N` reads the N m
 written spill images back into host RAM at startup in fixed MRU order, so a restart's first request
 avoids both the disk read and the initial prefill. Reads use sequential page-cache read-ahead.
 `--kv-park-max-age-sec N` deletes spill images idle longer than N seconds (file mtime), independent
-of the byte budget; the budget still evicts least-recently-used entries when exceeded. Pinned
-shared-prefix images are never prefetched or age-deleted.
+of the byte budget. Pinned shared-prefix images are never prefetched or age-deleted.
+
+Spilled entries are retained by estimated value by default. Each image's sidecar records a
+conversation's restore count, reuse hits, creation time, and last hit; a restore carries those
+fields into the resumed lane, so they survive the one-shot disk cycle. The estimate compares the
+re-prefill seconds a future restore would avoid (matched frontier tokens divided by a measured
+prefill rate) against the time to read the image back (bytes divided by a measured read rate, plus
+a fixed staging cost), weighted by a return probability that grows with observed hits and decays
+with idle time:
+
+```
+idle = now - max(created, last_hit)
+p    = (hits + 1) / (hits + 2) * exp(-idle / half_life)
+net  = p * reusable_tokens / prefill_rate - bytes / read_bytes_per_sec - overhead
+```
+
+When the byte budget is exceeded, the entry with the lowest `net / bytes` is evicted, and an idle
+sweep retires entries whose `net` is already negative after a full half-life. This is what keeps a
+client-compacted conversation from pinning gigabytes of now-unreusable tail: once only a shallow
+prefix remains reusable, its value density falls and it is the first to go. Shared leading-block
+and tool-anchor images use `p = 1` and are not decayed. A restore is gated by the same cost
+components without the return-probability factor (an on-demand restore is certain to be used): a
+disk image whose marginal frontier over the resident prefix cannot pay for its read plus overhead is
+declined, keeps its file, and may be selected later by a deeper match. The writer applies the same
+test before spilling, so an image that could never justify its own load is not written at all.
+Only rate-dominated samples feed the measured rates: prefills below 1024 tokens or 0.25 s and
+reads below 64 MiB or 0.05 s are ignored, because a short request is dominated by fixed startup
+latency and would otherwise make every restore look profitable. `--kv-park-lru` restores the
+previous least-recently-used behavior byte-for-byte, and the rate knobs exist only to override the
+measured values used on unusual storage.
+
+`--status-line` adds an operator-facing live line on stderr:
+
+```
+status req=42 fp=9f3a1c07 prefill [########----------------] 58.5% 8192/14000 1.14k tok/s
+       eta 5.1s vis 1/4 | run=2 pref=1 ready=1 wait=0 dec=18 tok/s
+       | kv ram 12.0G/16.0G e=7 disk 41.0G/64.0G e=13 hit=4 spill=9 evict=3 up=01:02:13
+```
+
+`req` is the monotonic HTTP request id, `fp` the low eight hex digits of an FNV-1a-64 over the
+prepared token ids (stable across protocols that render the same conversation), and the media
+section reports host-side acquisition/preprocessing plus vision items encoded during prefill. The
+line is redrawn in place only when stderr is a terminal; under `ninfer_tui.py` or a pipe it is
+emitted through the ordinary logger as a terminated `status ...` line at
+`--log-stats-interval-ms`, so existing line parsers keep working. The request-start JSONL record
+gains the same 16-digit fingerprint (an additive field; the schema version is unchanged).
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including
