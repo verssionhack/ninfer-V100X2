@@ -14,13 +14,25 @@
 // rows, dequantizing into *shared* memory once per K-pass and feeding mma.sync directly. NVFP4
 // never got the equivalent. This is that kernel.
 //
-// Copied verbatim from q4_volta_mma_gemm.cuh: the schedule (4 warps, 32-row T tile, double-
-// buffered shared staging, split-K via volta_mma_splits.h's shared CTA-budget logic), the
-// pipeline shape (issue loads, run MMA on the *previous* tile, only then decode-and-store the
-// new one -- fusing load+decode+store into one step left global latency exposed with nothing to
-// hide it behind, per that file's own note), and the fp32-partial/atomicAdd/narrow structure for
-// splits>1. What's new is entirely in prefetch()/commit(): NVFP4's decoder (from
-// nvfp4_volta_qpn_gemm.cuh, not re-derived) and its swizzled scale plane.
+// Derived from q4_volta_mma_gemm.cuh: the double-buffered shared staging, the pipeline shape
+// (issue loads, run MMA on the *previous* tile, only then decode-and-store the new one -- fusing
+// load+decode+store into one step left global latency exposed with nothing to hide it behind, per
+// that file's own note), and the fp32-partial/atomicAdd/narrow structure for splits>1. What's new
+// is mostly in prefetch()/commit(): NVFP4's decoder (from nvfp4_volta_qpn_gemm.cuh, not
+// re-derived) and its swizzled scale plane.
+//
+// The CTA tile is 64 output rows x 64 tokens over 8 warps (4 along N, 2 along T), not Q4's
+// 32 x 32 x 4: at prefill T the small tile re-decodes the same weight tile once per token tile
+// and re-streams the activation tile once per output tile, which measured 24-35% slower than
+// plain dequant + CUTLASS. The wider tile halves both counts (measured: 13.62s -> 11.93s on a
+// 13K prefill), and the weight rows are decoded cooperatively one 8-row group per warp, so each
+// row is decoded once per CTA and reused by both token warps -- the same "decode a weight tile
+// once, walk the token rows under it" schedule the Strata expert kernels use.
+//
+// 64x64 with 3 CTAs/SM measured faster than 128x64 with 16 warps and one CTA/SM (11.93s vs
+// 12.09s), even though the wider tile halves activation traffic again: this kernel is limited by
+// load latency at 2-stage buffering, so warps in flight matter more than bytes. Any further tile
+// growth needs a deeper pipeline first.
 //
 // The one structural wrinkle: mma.sync.m8n8k4's B-fragment (the weight's own 32-row axis for the
 // QPN kernel, but here the *A*-adjacent 8-row axis feeding volta_load_k) needs each warp's 8 rows'
@@ -54,11 +66,15 @@ namespace ninfer::ops::detail {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
 
 struct Nvfp4VoltaMmaSchedule {
-    static constexpr int kWarps      = 4;
+    static constexpr int kWarps      = 8;
+    static constexpr int kWarpsN     = 4;  // warps tiled along output rows
+    static constexpr int kWarpsT     = 2;  // warps tiled along the token axis
+    static constexpr int kNPerWarp   = 16; // two 8-row mma B groups per warp
     static constexpr int kKStep      = 32; // exactly two 16-k NVFP4 groups per iteration
-    static constexpr int kTTile      = 32;
+    static constexpr int kTTileWarp  = 32; // rows of the mma A operand, per warp
+    static constexpr int kTTile      = kWarpsT * kTTileWarp;
     static constexpr int kXPad       = 8;
-    static constexpr int kRowsPerCta = kWarps * 8;
+    static constexpr int kRowsPerCta = kWarpsN * kNPerWarp;
     static constexpr int kThreads    = kWarps * 32;
 };
 
@@ -74,7 +90,7 @@ __device__ __forceinline__ void nvfp4_mma_unshuffle(const half2 (&out)[4], half2
 }
 
 template <bool kDirect>
-__global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volta_mma_gemm_kernel(
+__global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 3) void nvfp4_volta_mma_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, float* __restrict__ partial,
     __nv_bfloat16* __restrict__ out, int out_ld, int n, int k, int t,
@@ -83,12 +99,15 @@ __global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volt
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int n0   = (static_cast<int>(blockIdx.x) * S::kWarps + warp) * 8;
+    const int wn   = warp % S::kWarpsN;
+    const int wt   = warp / S::kWarpsN;
+    const int n0   = static_cast<int>(blockIdx.x) * S::kRowsPerCta + wn * S::kNPerWarp;
     const int t0   = static_cast<int>(blockIdx.z) * S::kTTile;
     const int tcnt = min(S::kTTile, t - t0);
+    const int wtn  = min(S::kTTileWarp, t - (t0 + wt * S::kTTileWarp));
 
     __shared__ __align__(16) __half x_sh[2][S::kTTile][S::kKStep + S::kXPad];
-    __shared__ __align__(16) __half w_sh[2][S::kWarps][8][S::kKStep + S::kXPad];
+    __shared__ __align__(16) __half w_sh[2][S::kRowsPerCta][S::kKStep + S::kXPad];
 
     const int chunk  = (k / splits) & ~(S::kKStep - 1);
     const int kstart = static_cast<int>(blockIdx.y) * chunk;
@@ -119,12 +138,15 @@ __global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volt
             r.xraw        = *reinterpret_cast<const uint4*>(
                 x + static_cast<std::int64_t>(t0 + row) * k + kbase + v * 8);
         }
-        // Each of a warp's 8 output rows is served by 4 lanes; lane (row*4 + q) holds k-window
+        // The CTA's 64 weight rows are decoded cooperatively, one 8-row group per warp, so each
+        // row is decoded exactly once and shared by both token warps (the tile is 64x64; the
+        // redundant decode per token tile is what made this kernel lose to dequant+CUTLASS).
+        // Each of the 8 rows is served by 4 lanes; lane (row*4 + q) holds k-window
         // [kbase + q*8, kbase + q*8 + 8) of that row -- half of one 16-k group (q in {0,1}) or
         // the other half (q in {2,3}).
-        const int r_row = lane >> 2;
+        const int drow  = warp * 8 + (lane >> 2);
         const int q     = lane & 3;
-        const int row   = n0 + r_row;
+        const int row   = static_cast<int>(blockIdx.x) * S::kRowsPerCta + drow;
         r.row_good      = row < n;
         r.word          = 0;
         r.scale_byte    = 0;
@@ -154,7 +176,7 @@ __global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volt
             *reinterpret_cast<uint4*>(&x_sh[buf][idx / kVecs][(idx % kVecs) * 8]) =
                 *reinterpret_cast<const uint4*>(tmp);
         }
-        const int r_row = lane >> 2;
+        const int drow  = warp * 8 + (lane >> 2);
         const int q     = lane & 3;
         const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(r.scale_byte), divisor2);
         half2 raw[4];
@@ -165,11 +187,12 @@ __global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volt
         for (int j = 0; j < 4; ++j) { adj[j] = __hmul2(adj[j], sc2); }
         // q directly indexes this lane's 8-k window within the 32-wide kKStep tile (k offsets
         // 0,8,16,24), so the half-unit store offset is simply q*8.
-        *reinterpret_cast<uint4*>(&w_sh[buf][warp][r_row][q * 8]) =
+        *reinterpret_cast<uint4*>(&w_sh[buf][drow][q * 8]) =
             *reinterpret_cast<const uint4*>(adj);
     };
 
-    float d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float d0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float d1[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
     prefetch(kstart, carry);
     commit(carry, 0);
@@ -182,28 +205,38 @@ __global__ __launch_bounds__(Nvfp4VoltaMmaSchedule::kThreads, 8) void nvfp4_volt
 
 #pragma unroll
         for (int kk = 0; kk < S::kKStep; kk += 8) {
-            half2 a[4], b[4];
-            volta_load_qp(a, reinterpret_cast<const half2*>(&x_sh[buf][0][kk]),
+            half2 a[4], b0[4], b1[4];
+            volta_load_qp(a, reinterpret_cast<const half2*>(&x_sh[buf][wt * S::kTTileWarp][kk]),
                           (S::kKStep + S::kXPad) / 2);
-            volta_load_k(b, reinterpret_cast<const half2*>(&w_sh[buf][warp][0][kk]),
+            volta_load_k(b0, reinterpret_cast<const half2*>(&w_sh[buf][wn * S::kNPerWarp][kk]),
                          (S::kKStep + S::kXPad) / 2);
-            volta_mma_qk(d, a, b);
+            volta_load_k(b1,
+                         reinterpret_cast<const half2*>(&w_sh[buf][wn * S::kNPerWarp + 8][kk]),
+                         (S::kKStep + S::kXPad) / 2);
+            volta_mma_qk(d0, a, b0);
+            volta_mma_qk(d1, a, b1);
         }
 
         if (has_next) { commit(carry, buf ^ 1); }
         buf ^= 1;
     }
 
+    float* const acc[2] = {d0, d1};
 #pragma unroll
-    for (int l = 0; l < 8; ++l) {
-        const int row_t = volta_d_get_i(l);
-        const int col_n = n0 + volta_d_get_j(l);
-        if (row_t < tcnt && col_n < n) {
-            if constexpr (kDirect) {
-                out[static_cast<std::int64_t>(t0 + row_t) * out_ld + col_n] =
-                    __float2bfloat16(d[l]);
-            } else {
-                atomicAdd(&partial[static_cast<std::int64_t>(t0 + row_t) * n + col_n], d[l]);
+    for (int g = 0; g < 2; ++g) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int row_w = volta_d_get_i(l);
+            const int col_n = n0 + g * 8 + volta_d_get_j(l);
+            if (row_w < wtn && col_n < n) {
+                if constexpr (kDirect) {
+                    out[static_cast<std::int64_t>(t0 + wt * S::kTTileWarp + row_w) * out_ld +
+                        col_n] = __float2bfloat16(acc[g][l]);
+                } else {
+                    atomicAdd(&partial[static_cast<std::int64_t>(t0 + wt * S::kTTileWarp +
+                                                                row_w) * n + col_n],
+                              acc[g][l]);
+                }
             }
         }
     }
