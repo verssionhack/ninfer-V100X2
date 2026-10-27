@@ -312,8 +312,13 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an out-of-range --status-line-interval-ms was accepted");
     }
+    const ServeOptions console_log =
+        parse({"ninfer-serve", "model.ninfer", "--console-log-file", "profiles/serve.log"});
+    failures += check(console_log.console_log_file == "profiles/serve.log",
+                      "console log file did not reach serving options");
     const std::string usage = serve_usage_text("ninfer-serve");
     failures += check(usage.find("--status-line") != std::string::npos &&
+                          usage.find("--console-log-file") != std::string::npos &&
                           usage.find("--kv-park-restore-min-saving-ms") != std::string::npos,
                       "the usage text does not document the new options");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&

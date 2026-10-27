@@ -46,6 +46,15 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (!options.console_log_file.empty()) {
+            std::string error;
+            if (!ninfer::serve::open_console_log_file(options.console_log_file, error)) {
+                ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
+                                                 "--console-log-file: " + error);
+                return 1;
+            }
+        }
+
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {

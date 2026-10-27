@@ -611,6 +611,7 @@ client-side override.
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--console-log-file FILE` | append plain console log lines to FILE while stderr keeps the in-place status line; startup aborts if FILE cannot be opened | unset |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
@@ -939,16 +940,19 @@ measured values used on unusual storage.
 
 ```
 status req=42 fp=9f3a1c07 prefill [########----------------] 58.5% 8192/14000 1.14k tok/s
-       eta 5.1s vis 1/4 | run=2 pref=1 ready=1 wait=0 dec=18 tok/s
+       eta 5.1s vis 1/4 | run=2 pref=1 ready=1 wait=0 d/p=18/1.14k tok/s
        | kv ram 12.0G/16.0G e=7 disk 41.0G/64.0G e=13 hit=4 spill=9 evict=3 up=01:02:13
 ```
 
 `req` is the monotonic HTTP request id, `fp` the low eight hex digits of an FNV-1a-64 over the
-prepared token ids (stable across protocols that render the same conversation), and the media
-section reports host-side acquisition/preprocessing plus vision items encoded during prefill. The
-line is redrawn in place only when stderr is a terminal; under `ninfer_tui.py` or a pipe it is
+prepared token ids (stable across protocols that render the same conversation), the media
+section reports host-side acquisition/preprocessing plus vision items encoded during prefill, and
+`d/p` shows the current decode and prefill token rates. The line is redrawn in place only when
+stderr is a terminal, leaving previous logs above it; under `ninfer_tui.py` or a pipe it is
 emitted through the ordinary logger as a terminated `status ...` line at
-`--log-stats-interval-ms`, so existing line parsers keep working. The request-start JSONL record
+`--log-stats-interval-ms`, so existing line parsers keep working. Because a pipe disables the
+in-place redraw, `--console-log-file FILE` captures the plain log lines while stderr stays on the
+terminal; it does not capture the raw `NINFER_*_TRACE` instrumentation. The request-start JSONL record
 gains the same 16-digit fingerprint (an additive field; the schema version is unchanged).
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send

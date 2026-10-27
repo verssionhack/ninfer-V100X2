@@ -166,10 +166,9 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
     }
 
     out << " | run=" << stats.running_requests << " pref=" << stats.prefilling_requests
-        << " ready=" << stats.decode_ready_requests << " wait=" << stats.waiting_requests;
-    if (snapshot.decode_rate_tok_s > 0.5) {
-        out << " dec=" << format_rate(snapshot.decode_rate_tok_s) << " tok/s";
-    }
+        << " ready=" << stats.decode_ready_requests << " wait=" << stats.waiting_requests
+        << " d/p=" << format_rate(snapshot.decode_rate_tok_s) << '/'
+        << format_rate(snapshot.prefill_rate_tok_s) << " tok/s";
 
     const ninfer::KvParkStats& kv = stats.kv_park;
     if (kv.ram_budget != 0 || kv.ram_entries != 0 || kv.disk_budget != 0 ||
@@ -257,22 +256,23 @@ void StatusLineReporter::render_once() {
         }
     }
 
+    // Average prefill progress over a >= 1 s window. Progress arrives in whole prefill chunks, so
+    // a per-tick rate alternates between zero and a burst and makes the bar and ETA jump.
     const double prefill_dt = std::chrono::duration<double>(now - last_prefill_time_).count();
     if (stats.prefill_request_id != 0 && stats.prefill_request_id == last_prefill_id_) {
-        if (prefill_dt > 0.001 && stats.prefill_processed_tokens >= last_prefill_tokens_) {
-            const double instantaneous =
-                static_cast<double>(stats.prefill_processed_tokens - last_prefill_tokens_) /
-                prefill_dt;
-            prefill_rate_ = prefill_rate_ <= 0.0
-                                ? instantaneous
-                                : 0.3 * instantaneous + 0.7 * prefill_rate_;
+        if (prefill_dt >= 1.0 && stats.prefill_processed_tokens >= last_prefill_tokens_) {
+            prefill_rate_        = static_cast<double>(stats.prefill_processed_tokens -
+                                                last_prefill_tokens_) /
+                            prefill_dt;
+            last_prefill_tokens_ = stats.prefill_processed_tokens;
+            last_prefill_time_   = now;
         }
     } else {
-        prefill_rate_ = 0.0;
+        prefill_rate_        = 0.0;
+        last_prefill_tokens_ = stats.prefill_processed_tokens;
+        last_prefill_time_   = now;
     }
-    last_prefill_id_     = stats.prefill_request_id;
-    last_prefill_tokens_ = stats.prefill_processed_tokens;
-    last_prefill_time_   = now;
+    last_prefill_id_ = stats.prefill_request_id;
 
     const double decode_dt = std::chrono::duration<double>(now - last_decode_time_).count();
     if (decode_dt > 0.001 && stats.committed_decode_tokens >= last_decode_tokens_) {

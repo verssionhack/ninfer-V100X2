@@ -44,6 +44,7 @@ int main() {
     const std::string idle_line = format_status_line(idle, false);
     check(contains(idle_line, "status idle"), "an empty snapshot must report idle");
     check(contains(idle_line, "up=1h02m"), "the status line must carry uptime");
+    check(contains(idle_line, "d/p=0/0 tok/s"), "an idle line must still show decode/prefill speeds");
     check(idle_line.find('\r') == std::string::npos, "the formatter must never emit carriage returns");
 
     StatusSnapshot busy;
@@ -89,7 +90,8 @@ int main() {
     check(contains(line, "eta "), "a partial prefill must show an ETA");
     check(contains(line, "vis 1/4"), "the status line must show vision item progress");
     check(contains(line, "run=2"), "the status line must show scheduler occupancy");
-    check(contains(line, "dec=18 tok/s"), "the status line must show the decode rate");
+    check(contains(line, "d/p=18/1.14k tok/s"),
+          "the status line must show decode/prefill speeds as d/p");
     check(contains(line, "kv ram 12.0G/16.0G e=7"), "the status line must show RAM park gauges");
     check(contains(line, "disk 41.0G/64.0G e=13"), "the status line must show disk spill gauges");
     check(contains(line, "hit=4"), "the status line must count restores as hits");

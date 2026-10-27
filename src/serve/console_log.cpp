@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -28,6 +30,11 @@ const char* level_name(ConsoleLogLevel level) noexcept {
 std::mutex& console_mutex() {
     static std::mutex mutex;
     return mutex;
+}
+
+std::ofstream& console_log_file() {
+    static std::ofstream file;
+    return file;
 }
 
 std::string& status_text() {
@@ -89,9 +96,31 @@ std::string current_console_log_prefix(ConsoleLogLevel level) {
 void write_console_log(ConsoleLogLevel level, std::string_view message) {
     std::lock_guard lock(console_mutex());
     erase_status_locked();
-    std::cerr << current_console_log_prefix(level) << message << '\n';
+    const std::string line = current_console_log_prefix(level) + std::string(message);
+    std::cerr << line << '\n';
     draw_status_locked();
     std::cerr.flush();
+    std::ofstream& file = console_log_file();
+    if (file.is_open()) {
+        file << line << '\n';
+        file.flush();
+    }
+}
+
+bool open_console_log_file(std::string_view path, std::string& error) {
+    std::error_code code;
+    const std::filesystem::path target(path);
+    if (target.has_parent_path() && !std::filesystem::is_directory(target.parent_path(), code)) {
+        error = "parent directory does not exist: " + target.parent_path().string();
+        return false;
+    }
+    std::lock_guard lock(console_mutex());
+    console_log_file().open(target, std::ios::out | std::ios::app);
+    if (!console_log_file().is_open()) {
+        error = "cannot open " + target.string() + " for append";
+        return false;
+    }
+    return true;
 }
 
 void set_console_status_line(std::string_view line) {
