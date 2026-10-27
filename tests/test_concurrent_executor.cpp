@@ -342,6 +342,23 @@ public:
     void evict_retained_lane(std::uint32_t) noexcept {}
     // The graceful-shutdown dump is a real-Program concern; the fake has nothing to persist.
     void persist_state() {}
+    // The parked/spilled KV tier is likewise a real-Program concern: the fake reports an empty
+    // tier and has no background I/O to pump, no parked plan, and no encoded vision items.
+    enum class ParkedRestoreGate { Proceed, Loading, Unavailable };
+    [[nodiscard]] ParkedRestoreGate gate_parked_restore(const ScriptedPlan&) const noexcept {
+        return ParkedRestoreGate::Proceed;
+    }
+    [[nodiscard]] ParkedRestoreGate gate_share_source(const ScriptedPlan&,
+                                                      const q36::PreparedPrompt&) const noexcept {
+        return ParkedRestoreGate::Proceed;
+    }
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+    prefill_vision_progress(std::uint32_t) const noexcept {
+        return {0, 0};
+    }
+    [[nodiscard]] ninfer::KvParkStats kv_park_stats() const noexcept { return {}; }
+    void pump_parked_io() noexcept {}
+    [[nodiscard]] bool parked_io_pending() const noexcept { return false; }
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
         return {};
     }
@@ -859,6 +876,7 @@ void test_prefill_progress_is_published(const q36::Frontend& frontend,
     // Sample the lane until the request is admitted and then has left it.
     std::uint32_t observed_prompt = 0;
     std::uint32_t max_processed   = 0;
+    double max_prefill_rate       = 0.0;
     std::vector<std::uint32_t> processed;
     bool saw_prefill       = false;
     bool saw_cleared_after = false;
@@ -869,6 +887,9 @@ void test_prefill_progress_is_published(const q36::Frontend& frontend,
             observed_prompt = stats.prefill_prompt_tokens;
             if (stats.prefill_processed_tokens > max_processed) {
                 max_processed = stats.prefill_processed_tokens;
+            }
+            if (stats.prefill_tokens_per_second > max_prefill_rate) {
+                max_prefill_rate = stats.prefill_tokens_per_second;
             }
             processed.push_back(stats.prefill_processed_tokens);
         } else if (saw_prefill) {
@@ -895,6 +916,13 @@ void test_prefill_progress_is_published(const q36::Frontend& frontend,
     expect(max_processed <= prompt_tokens, "published prefill progress exceeded the prompt length");
     expect(max_processed + 1 >= prompt_tokens,
            "published prefill progress stalled short of the prompt; final observable step missed");
+    // One scripted token per ~15 ms step, so the measured lane rate is tens of tokens per second.
+    // It must be published at all; a reader differencing progress instead would only see chunk
+    // size, because progress lands once per step.
+    expect(max_prefill_rate > 0.0,
+           "the engine did not publish a measured prefill rate while the lane was active");
+    expect(max_prefill_rate < 10000.0,
+           "the measured prefill rate was implausibly high for the scripted step delay");
     expect(saw_cleared_after, "prefill progress was not cleared once the request left the lane");
 }
 

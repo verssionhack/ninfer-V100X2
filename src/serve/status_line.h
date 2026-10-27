@@ -33,7 +33,9 @@ struct StatusSnapshot {
     std::optional<LiveRequestSnapshot> prefill;
     // Oldest request still in host-side preparation (media acquisition/preprocessing), if any.
     std::optional<LiveRequestSnapshot> preparing;
-    double prefill_rate_tok_s = 0.0;
+    // Decode rate over the reporter's own sampling window (the committed counter advances every
+    // round, so it never quantizes). Prefill speed is not stored here: the engine publishes it in
+    // `stats.prefill_tokens_per_second`, measured where the prefill work runs.
     double decode_rate_tok_s  = 0.0;
     std::uint64_t uptime_seconds = 0;
 };
@@ -65,10 +67,6 @@ private:
     bool stopping_ = false;
     bool started_  = false;
 
-    std::uint64_t last_prefill_id_       = 0;
-    std::uint32_t last_prefill_tokens_   = 0;
-    std::chrono::steady_clock::time_point last_prefill_time_;
-    double prefill_rate_                 = 0.0;
     std::uint64_t last_decode_tokens_    = 0;
     std::chrono::steady_clock::time_point last_decode_time_;
     double decode_rate_                  = 0.0;

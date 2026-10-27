@@ -76,17 +76,18 @@ int main() {
     request.media_total  = 3;
     request.media_done   = 3;
     request.media_phase  = MediaPhase::Preprocess;
-    busy.prefill          = request;
-    busy.prefill_rate_tok_s = 1140.0;
-    busy.decode_rate_tok_s  = 18.4;
-    busy.uptime_seconds     = 500;
+    busy.prefill                = request;
+    busy.stats.prefill_tokens_per_second = 1140.0;
+    busy.decode_rate_tok_s      = 18.4;
+    busy.uptime_seconds         = 500;
 
     const std::string line = format_status_line(busy, false);
     check(contains(line, "req=42"), "the status line must name the prefilling request");
     check(contains(line, "fp=9f3a1c07"), "the status line must carry the short fingerprint");
     check(contains(line, "58.5%"), "the prefill percentage must reflect processed tokens");
     check(contains(line, "8192/14000"), "the status line must show processed/total tokens");
-    check(contains(line, "1.14k tok/s"), "the status line must show the prefill rate");
+    check(contains(line, "1.14k tok/s"),
+          "the status line must show the engine-measured prefill rate");
     check(contains(line, "eta "), "a partial prefill must show an ETA");
     check(contains(line, "vis 1/4"), "the status line must show vision item progress");
     check(contains(line, "run=2"), "the status line must show scheduler occupancy");

@@ -141,12 +141,12 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
             total != 0 ? 100.0 * static_cast<double>(std::min(done, total)) / total : 0.0;
         out << " prefill [" << progress_bar(percent) << "] " << std::fixed << std::setprecision(1)
             << percent << "% " << done << '/' << total;
-        if (snapshot.prefill_rate_tok_s > 0.5) {
-            out << ' ' << format_rate(snapshot.prefill_rate_tok_s) << " tok/s";
+        const double prefill_rate = stats.prefill_tokens_per_second;
+        if (prefill_rate > 0.5) {
+            out << ' ' << format_rate(prefill_rate) << " tok/s";
             if (total > done) {
                 out << " eta "
-                    << format_eta(static_cast<double>(total - done) /
-                                  snapshot.prefill_rate_tok_s);
+                    << format_eta(static_cast<double>(total - done) / prefill_rate);
             }
         }
         wrote_work = true;
@@ -168,7 +168,7 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
     out << " | run=" << stats.running_requests << " pref=" << stats.prefilling_requests
         << " ready=" << stats.decode_ready_requests << " wait=" << stats.waiting_requests
         << " d/p=" << format_rate(snapshot.decode_rate_tok_s) << '/'
-        << format_rate(snapshot.prefill_rate_tok_s) << " tok/s";
+        << format_rate(stats.prefill_tokens_per_second) << " tok/s";
 
     const ninfer::KvParkStats& kv = stats.kv_park;
     if (kv.ram_budget != 0 || kv.ram_entries != 0 || kv.disk_budget != 0 ||
@@ -190,8 +190,8 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
 }
 
 StatusLineReporter::StatusLineReporter(GenerationService& service, StatusLineOptions options)
-    : service_(service), options_(options), last_prefill_time_(Clock::now()),
-      last_decode_time_(Clock::now()), started_at_(Clock::now()), last_log_(Clock::now()) {}
+    : service_(service), options_(options), last_decode_time_(Clock::now()),
+      started_at_(Clock::now()), last_log_(Clock::now()) {}
 
 StatusLineReporter::~StatusLineReporter() { stop(); }
 
@@ -256,24 +256,6 @@ void StatusLineReporter::render_once() {
         }
     }
 
-    // Average prefill progress over a >= 1 s window. Progress arrives in whole prefill chunks, so
-    // a per-tick rate alternates between zero and a burst and makes the bar and ETA jump.
-    const double prefill_dt = std::chrono::duration<double>(now - last_prefill_time_).count();
-    if (stats.prefill_request_id != 0 && stats.prefill_request_id == last_prefill_id_) {
-        if (prefill_dt >= 1.0 && stats.prefill_processed_tokens >= last_prefill_tokens_) {
-            prefill_rate_        = static_cast<double>(stats.prefill_processed_tokens -
-                                                last_prefill_tokens_) /
-                            prefill_dt;
-            last_prefill_tokens_ = stats.prefill_processed_tokens;
-            last_prefill_time_   = now;
-        }
-    } else {
-        prefill_rate_        = 0.0;
-        last_prefill_tokens_ = stats.prefill_processed_tokens;
-        last_prefill_time_   = now;
-    }
-    last_prefill_id_ = stats.prefill_request_id;
-
     const double decode_dt = std::chrono::duration<double>(now - last_decode_time_).count();
     if (decode_dt > 0.001 && stats.committed_decode_tokens >= last_decode_tokens_) {
         const double instantaneous =
@@ -284,8 +266,7 @@ void StatusLineReporter::render_once() {
     last_decode_tokens_ = stats.committed_decode_tokens;
     last_decode_time_   = now;
 
-    snapshot.prefill_rate_tok_s = prefill_rate_;
-    snapshot.decode_rate_tok_s  = decode_rate_;
+    snapshot.decode_rate_tok_s = decode_rate_;
     snapshot.uptime_seconds     = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(now - started_at_).count());
 

@@ -947,7 +947,12 @@ status req=42 fp=9f3a1c07 prefill [########----------------] 58.5% 8192/14000 1.
 `req` is the monotonic HTTP request id, `fp` the low eight hex digits of an FNV-1a-64 over the
 prepared token ids (stable across protocols that render the same conversation), the media
 section reports host-side acquisition/preprocessing plus vision items encoded during prefill, and
-`d/p` shows the current decode and prefill token rates. The line is redrawn in place only when
+`d/p` shows the current decode and prefill token rates. The prefill rate is measured by the engine
+around each prefill step -- processed tokens over the wall time since the previous step finished,
+so decode rounds interleaved by the scheduler count against prefill advance -- smoothed across
+steps and published in `RuntimeStats`. It is not differenced from the progress counter, which only
+moves when a whole chunk lands and so would report the chunk size rather than throughput; the
+prefill ETA divides the remaining tokens by that measured rate. The line is redrawn in place only when
 stderr is a terminal, leaving previous logs above it; under `ninfer_tui.py` or a pipe it is
 emitted through the ordinary logger as a terminated `status ...` line at
 `--log-stats-interval-ms`, so existing line parsers keep working. Because a pipe disables the

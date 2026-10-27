@@ -710,6 +710,12 @@ struct RuntimeStats {
     // Engine-local id of the request on the prefill lane, so a status reader can name it. Zero
     // when no prefill is in flight.
     std::uint64_t prefill_request_id = 0;
+    // Measured throughput of that lane: processed prompt tokens divided by the wall time since
+    // the previous lane step completed -- so decode rounds the scheduler interleaved count against
+    // prefill advance, which is what an ETA needs -- smoothed across steps. A reader differencing
+    // `prefill_processed_tokens` instead can only ever see the chunk size, because progress moves
+    // once per step. Zero until the first step completes, and cleared with the lane.
+    double prefill_tokens_per_second = 0.0;
     // Vision items encoded so far by that request's prefill session, and its total encoded
     // items. Both are zero for a text-only prompt.
     std::uint32_t prefill_vision_done  = 0;

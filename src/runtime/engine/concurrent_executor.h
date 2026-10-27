@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -266,9 +267,10 @@ private:
         if (prefill_lane_) {
             if (const std::shared_ptr<Request>& active = slots_[*prefill_lane_];
                 active != nullptr) {
-                snapshot.prefill_prompt_tokens    = active->prompt_summary.prompt_tokens;
-                snapshot.prefill_processed_tokens = active->prefill_processed_tokens;
-                snapshot.prefill_request_id       = active->id;
+                snapshot.prefill_prompt_tokens     = active->prompt_summary.prompt_tokens;
+                snapshot.prefill_processed_tokens  = active->prefill_processed_tokens;
+                snapshot.prefill_request_id        = active->id;
+                snapshot.prefill_tokens_per_second = active->prefill_tokens_per_second;
                 snapshot.prefill_vision_done =
                     active->prefill_vision_done.load(std::memory_order_relaxed);
                 snapshot.prefill_vision_total =
@@ -397,6 +399,14 @@ private:
         // Prompt tokens of this request made resident so far (reused prefix + prefill work), a
         // live progress readout for the runtime-stats snapshot while it owns the prefill lane.
         std::uint32_t prefill_processed_tokens = 0;
+        // Measured prefill throughput: an EWMA over this request's lane steps of processed
+        // tokens per wall-clock second. Worker-owned; published in the stats snapshot while the
+        // request owns the lane. Reused-prefix tokens are resident before the first step and are
+        // not part of any step, so they do not count.
+        double prefill_tokens_per_second = 0.0;
+        // Completion time of the last lane step, the start of the next step's measurement
+        // window. Empty until the first step.
+        std::optional<Clock::time_point> prefill_rate_anchor;
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -754,6 +764,31 @@ private:
         return active;
     }
 
+    // Fold one Program prefill step into the request's measured rate. The window runs from the
+    // end of the previous step to the end of this one, so any decode rounds or other work the
+    // scheduler interleaved between steps are charged to prefill advance: that is the rate the
+    // status ETA must divide by. The first step has no anchor and is timed on its own. A status
+    // reader differencing `prefill_processed_tokens` instead sees progress land in chunk-sized
+    // jumps and can only recover the chunk size, not the rate. Very short steps are skipped:
+    // their wall time is dominated by call overhead and would report a misleadingly high rate.
+    static void account_prefill_rate(Request& request, std::uint32_t tokens,
+                                     Clock::time_point step_started,
+                                     Clock::time_point step_finished) noexcept {
+        const Clock::time_point window_start =
+            request.prefill_rate_anchor ? *request.prefill_rate_anchor : step_started;
+        request.prefill_rate_anchor = step_finished;
+        const double seconds =
+            std::chrono::duration<double>(step_finished - window_start).count();
+        constexpr double kMinimumStepSeconds = 0.001;
+        if (tokens == 0 || !(seconds >= kMinimumStepSeconds)) { return; }
+        const double rate = static_cast<double>(tokens) / seconds;
+        if (!std::isfinite(rate) || rate <= 0.0) { return; }
+        request.prefill_tokens_per_second =
+            request.prefill_tokens_per_second <= 0.0
+                ? rate
+                : 0.3 * rate + 0.7 * request.prefill_tokens_per_second;
+    }
+
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
@@ -827,11 +862,14 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        const Clock::time_point step_started = Clock::now();
         const PrefillStepResult step =
             instance_.program->advance_prefill_lane(lane, prefill_step_tokens());
+        const Clock::time_point step_finished = Clock::now();
         const auto vision                     = instance_.program->prefill_vision_progress(lane);
         request->prefill_vision_done.store(vision.first, std::memory_order_relaxed);
         request->prefill_vision_total.store(vision.second, std::memory_order_relaxed);
+        account_prefill_rate(*request, step.processed_prompt_tokens, step_started, step_finished);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();
@@ -1067,13 +1105,17 @@ private:
                 transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
-            target_started                = true;
+            target_started                        = true;
+            const Clock::time_point first_started = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 prefill_step_tokens());
+            const Clock::time_point first_finished = Clock::now();
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
+            account_prefill_rate(*request, first.processed_prompt_tokens, first_started,
+                                 first_finished);
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
