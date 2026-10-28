@@ -6,8 +6,11 @@ in RAM but omits unselected pages from attention (including long prefill). `--ma
 the logical limit; omitted `--kv-capacity` follows the RAM window instead. If explicitly provided,
 KV capacity must equal that window. `--ram-kv-budget-bytes` defaults to 32000000000 and bounds the
 maximum archive across all ranks, not process RSS. Window must be a multiple of 64, at least
-prefill-chunk+8192 (PP2: prefill-chunk*pipeline-chunks+8192), and no larger than max-context.
-Only one active request; no Vision/DFlash/TP4.
+prefill-chunk+8192 (PP2: prefill-chunk*pipeline-chunks+8192), and no larger than max-context;
+each concurrent lane keeps `window / max-concurrency` tokens resident. `--ram-kv-lrfu` ranks
+resident pages by a decaying recency/frequency history instead of the current query alone
+(`--ram-kv-lrfu-lambda` 0..1, default 0.5; `--ram-kv-lrfu-top-fraction` in (0,1], default 0.9),
+and is a no-op without `--ram-kv-window`. No Vision/DFlash/TP4.
 
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.

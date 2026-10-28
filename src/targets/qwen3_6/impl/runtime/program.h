@@ -20,6 +20,8 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
+#include "kvmem/lrfu.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -260,6 +262,8 @@ struct SequenceState {
     HostCheckpoint resume_anchor;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
+    // actkv: per-sequence LRFU history over RAM-KV page blocks, carried across retrieval rounds.
+    std::optional<kvmem::LrfuHistory> lrfu;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -850,6 +854,9 @@ private:
     void restore_historical_checkpoint(SequenceState& sequence, std::uint32_t checkpoint_index,
                                        bool preserve);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
+    // Resident-window size for one sequence in tokens: the per-lane KV entitlement when the pool is
+    // shared across concurrent lanes, else the configured window.
+    [[nodiscard]] std::uint32_t ram_kv_window_tokens(const SequenceState& sequence) const noexcept;
     // Demand allocation behind VisionSwapHooks: evicts enough of the persistent arena to host
     // memory for one Vision encode; restore puts the evicted bytes back. Both no-op unless
     // vision_kv_swap is on.

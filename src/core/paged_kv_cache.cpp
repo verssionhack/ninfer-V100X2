@@ -158,12 +158,14 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     layout.block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                              "Paged KV block tables");
     if (spec.ram_enabled) {
-        if (spec.table_rows != 1 || spec.plane_order != PagedKVPlaneOrder::PageMajor) {
-            throw std::invalid_argument("RAM KV requires one PageMajor table row");
+        if (spec.plane_order != PagedKVPlaneOrder::PageMajor) {
+            throw std::invalid_argument("RAM KV requires a PageMajor KV pool");
         }
-        layout.read_indices = builder.add_tensor(DType::I32, {logical_pages, 1}, 256,
+        // One read mapping per table row: with concurrent lanes every lane publishes its own
+        // column of the shared resident-window chronology.
+        layout.read_indices = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                                  "RAM KV read indices");
-        layout.read_tables = builder.add_tensor(DType::I32, {logical_pages, 1}, 256,
+        layout.read_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                                 "RAM KV chronological read table");
     }
     return layout;
@@ -221,6 +223,11 @@ std::uint32_t PagedKVPool::logical_page_capacity() const noexcept {
 }
 
 std::int32_t PagedKVPool::table_row_count() const noexcept { return spec_.table_rows; }
+
+std::uint32_t PagedKVPool::lane_page_share() const noexcept {
+    const auto rows = static_cast<std::uint32_t>(std::max<std::int32_t>(1, spec_.table_rows));
+    return spec_.page_group_count / rows;
+}
 
 std::size_t PagedKVPool::plane_count() const noexcept { return planes_.size(); }
 
@@ -736,7 +743,9 @@ Tensor PagedKVAllocation::block_table() const {
 
 PagedKVAllocation::ReleasePreview PagedKVAllocation::release_preview() const {
     ReleasePreview preview;
-    if (!valid() || ram_) { return preview; }
+    if (!valid()) { return preview; }
+    // RAM allocations count too: an archived logical page holds no physical page (-1) and simply
+    // contributes nothing to the freed count.
     preview.contribution = pool_contribution_;
     for (const std::int32_t page : page_ids_) {
         if (page >= 0 && pool_->page_use_count(page) == 1) { ++preview.freed_pages; }
@@ -1050,9 +1059,14 @@ void PagedKVAllocation::publish_ram_mapping(cudaStream_t stream) const {
         CUDA_CHECK(cudaMemcpyAsync(original.data, page_ids_.data(), page_ids_.size() * sizeof(int),
                                    cudaMemcpyHostToDevice, stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(pool_->read_indices().data, indices.data(),
+    // The pool's read mappings are {logical_pages, table_rows}; this lane owns one column.
+    const std::size_t column =
+        static_cast<std::size_t>(bound_row_) * pool_->logical_page_capacity();
+    auto* indices_dst = static_cast<std::int32_t*>(pool_->read_indices().data) + column;
+    auto* tables_dst  = static_cast<std::int32_t*>(pool_->read_tables().data) + column;
+    CUDA_CHECK(cudaMemcpyAsync(indices_dst, indices.data(),
                                indices.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(pool_->read_tables().data, table.data(), table.size() * sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(tables_dst, table.data(), table.size() * sizeof(int),
                                cudaMemcpyHostToDevice, stream));
     ram_->dirty = false;
 }

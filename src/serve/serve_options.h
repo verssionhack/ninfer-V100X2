@@ -27,6 +27,9 @@ struct ServeOptions {
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::string console_log_file;                 // empty => console log goes to stderr only
+    // One-shot raw capture of a single tool-bearing /v1/messages turn: the inbound JSON and the
+    // exact response bytes (SSE items or the non-stream body), then capture disables itself.
+    std::string capture_turn_path;                // empty => capture disabled
     std::uint32_t max_context              = 8192;
     // Rotary regime, mirroring the CLI. `--rope yarn` raises the ceiling `--max-context` is
     // checked against to `--yarn-origin x --yarn-factor`; Engine performs that check.

@@ -166,6 +166,12 @@ int main() {
               ram.ram_kv.budget_bytes == 32000000000ULL,
           "RAM KV did not separate logical and resident capacity");
     check(parse_cli(base()).ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
+    const auto lrfu = parse_cli(with({"--max-context", "262144", "--ram-kv-window", "98304",
+                                     "--ram-kv-lrfu", "--ram-kv-lrfu-lambda", "0.75",
+                                     "--ram-kv-lrfu-top-fraction", "0.5"}));
+    check(lrfu.ram_kv.lrfu && lrfu.ram_kv.lrfu_lambda == 0.75 &&
+              lrfu.ram_kv.lrfu_top_fraction == 0.5,
+          "LRFU flags were not parsed");
     check_vision_budget();
     if (failures != 0) {
         std::cerr << failures << " CLI option check(s) failed\n";

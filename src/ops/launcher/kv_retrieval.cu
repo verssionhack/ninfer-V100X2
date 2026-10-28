@@ -63,6 +63,12 @@ __global__ void key_kernel(PagedKVBatchLayerView cache, const int* pos, const in
     const int physical = static_cast<const int*>(cache.block_tables.data)[p];
     const int h = blockIdx.y;
     const int d = threadIdx.x;
+    // A RAM-KV logical page that is archived or not yet mapped has no physical page; it carries
+    // no key summary, and reading page -1 would run off the plane.
+    if (physical < 0) {
+        means[(p * cache.num_kv_heads + h) * 256 + d] = 0.0f;
+        return;
+    }
     const int size = min(64, last + 1 - p * 64);
     float sum = 0;
     for (int t = 0; t < size; ++t) {
@@ -153,7 +159,7 @@ void kv_retrieval_key_summary(PagedKVBatchLayerView cache, const Tensor& positio
     tensor(means, DType::FP32, "KV retrieval key means must be FP32");
     if (cache.head_dim != 256 || (cache.num_kv_heads != 2 && cache.num_kv_heads != 4) ||
         means.ne[0] != 256 || means.ne[1] != cache.num_kv_heads ||
-        means.ne[2] != cache.block_tables.ne[0] || cache.block_tables.ne[1] != 1 ||
+        means.ne[2] != cache.block_tables.ne[0] || cache.block_tables.ne[1] < 1 ||
         (cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
         (cache.dtype == DType::I8 && cache.quant_group != 64)) {
         throw std::invalid_argument("KV retrieval key geometry is invalid");

@@ -451,6 +451,40 @@ ninfer_add_op_test(ninfer_gqa_attention_test
 ninfer_add_op_test(ninfer_ram_kv_test
   SOURCES ops/test_ram_kv.cpp
   LIBRARIES ninfer_ops)
+# actkv: the vendored active-KV core (src/actkv, ported from KVMem) with its standalone host
+# suite, plus the LRFU policy test that composes kvmem::LrfuHistory with ninfer's page ranking.
+set(NINFER_ACTKV_TEST_DIR ${PROJECT_SOURCE_DIR}/src/actkv/tests)
+set(NINFER_ACTKV_HOST_TESTS
+  backend_rebind_test
+  checkpoint_image_test
+  checkpoint_policy_test
+  graph_recall_test
+  host_kv_storage_test
+  kv_content_test
+  kvmem_runtime_test
+  kvmem_store_test
+  mean_key_retrieval_test
+  memory_contract_test
+  native_kv_payload_test
+  native_residency_test
+  pinned_kv_tier_test
+  prefix_checkpoint_test
+  query_policy_test
+  raw_kv_store_test
+  spill_io_test
+  tiered_kv_storage_test
+  token_options_test)
+foreach(actkv_test IN LISTS NINFER_ACTKV_HOST_TESTS)
+  ninfer_add_test(ninfer_kvmem_${actkv_test}
+    SOURCES ${NINFER_ACTKV_TEST_DIR}/${actkv_test}.cpp
+    LIBRARIES actkv)
+endforeach()
+ninfer_add_test(ninfer_kvmem_graph_recall_cuda_test
+  SOURCES ${NINFER_ACTKV_TEST_DIR}/graph_recall_cuda_test.cpp
+  LIBRARIES actkv)
+ninfer_add_test(ninfer_actkv_lrfu_test
+  SOURCES test_actkv_lrfu.cpp
+  LIBRARIES actkv ninfer_core)
 ninfer_add_test(ninfer_ram_kv_real_test
   SOURCES targets/qwen3_6_27b/test_ram_kv_real.cpp
   LIBRARIES ninfer_engine)

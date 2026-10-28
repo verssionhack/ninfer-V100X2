@@ -12,8 +12,11 @@
 
 namespace ninfer::ops::detail {
 
+// Translates logical token positions through a RAM-KV resident mapping. `page_indices` is the
+// {logical_pages, table_rows} chronological index matrix; `table_rows` ({batch}, may be empty)
+// selects each batch element's column. Empty `table_rows` selects column 0.
 void gqa_remap_positions_launch(const Tensor& positions, const Tensor& page_indices,
-                                Tensor& out, cudaStream_t stream);
+                                const Tensor& table_rows, Tensor& out, cudaStream_t stream);
 
 enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt, VoltaFlash };
 

@@ -2,10 +2,19 @@
 
 Optional native RAM-KV uses the same public Engine and HTTP protocols, not a llama.cpp backend.
 Add `--ram-kv-window 98304 --ram-kv-budget-bytes 32000000000` to a 27B SM70 TP2 Text/MTP
-launch with `--max-context 180000` or `262144`. It supports one active request and CUDA Graphs.
+launch with `--max-context 180000` or `262144`. It supports multiple active requests and CUDA
+Graphs: the GPU window is one pool split evenly across `--max-concurrency` lanes, so each lane
+keeps `window / max-concurrency` tokens resident and archives the rest of its history.
 Omit `--kv-capacity`, or set it equal to the resident window. This is **approximate Q/K mean-vector
-retrieval**, including long prefill, and can miss history. RAM archive bytes are lossless, but that
-does not establish quality equivalence. No Vision/DFlash/TP4 in this mode. The archive budget is
+retrieval**, including long prefill, and can miss history. Add `--ram-kv-lrfu` to rank resident
+pages by a decaying recency/frequency history instead of the current query alone; the decay is
+`--ram-kv-lrfu-lambda` (in [0,1], default 0.5) and the reinforced fraction
+`--ram-kv-lrfu-top-fraction` (in (0,1], default 0.9). The LRFU history belongs to one conversation:
+it carries across turns of that conversation and is reset when the lane starts a new one. The flag is
+a no-op without `--ram-kv-window`. Retrieval scoring state is shared by the lanes, so the ranking is a
+heuristic under concurrency. RAM archive bytes are lossless, but that does not establish quality
+equivalence. `NINFER_RAM_KV_TRACE=1` reports each retrieval round (frontier, block count, whether
+LRFU ranked it, and the top score). No Vision/DFlash/TP4 in this mode. The archive budget is
 not an entire-server RAM cap; apply cgroup MemoryMax and disable swap separately when required.
 Server-start JSON records identify the resident window and maximum archive bytes. Default full
 history behavior and the advertised OpenAI/Anthropic request schemas are unchanged.
@@ -612,6 +621,7 @@ client-side override.
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--console-log-file FILE` | append plain console log lines to FILE while stderr keeps the in-place status line; startup aborts if FILE cannot be opened | unset |
+| `--capture-turn FILE` | one-shot raw capture of the first tool-bearing Anthropic `/v1/messages` turn (request JSON plus the exact response bytes) to FILE; capture stops after that turn | unset |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
@@ -976,6 +986,14 @@ emitted through the ordinary logger as a terminated `status ...` line at
 in-place redraw, `--console-log-file FILE` captures the plain log lines while stderr stays on the
 terminal; it does not capture the raw `NINFER_*_TRACE` instrumentation. The request-start JSONL record
 gains the same 16-digit fingerprint (an additive field; the schema version is unchanged).
+
+`--capture-turn FILE` is a one-shot diagnostic for agent frontends: the first Anthropic
+`/v1/messages` request that carries tool definitions is captured verbatim -- a preamble (time,
+request id, message/tool counts), the inbound JSON exactly as received, and every response byte
+written to the client (the SSE items for a streaming turn, or the final JSON body). A
+`<<< capture end: stop_reason=... tool_calls=N >>>` line closes the file; errors and client
+disconnects are recorded there too. Later turns are not captured: restart the server to arm it
+again. The file contains the full conversation and tool results, so delete it when done.
 
 `--shared-prefix` adds two boundaries in the static leading block that agent frontends send
 first: one after the tool definitions, and one after the whole block including

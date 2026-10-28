@@ -21,13 +21,19 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// `indices` is the {logical_pages, rows} chronological mapping; each batch element resolves its
+// own column through `table_rows`, the same selector the attention kernels use for block_tables.
 __global__ void remap_positions_kernel(const std::int32_t* positions,
-                                       const std::int32_t* indices, std::int32_t* out, int count) {
+                                       const std::int32_t* indices,
+                                       const std::int32_t* table_rows, std::int32_t* out,
+                                       int count, int tokens, int logical_pages) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) {
-        const int p = positions[i];
-        out[i] = indices[p / kPagedKVPageSize] * kPagedKVPageSize + p % kPagedKVPageSize;
-    }
+    if (i >= count) { return; }
+    const int batch = tokens > 0 ? i / tokens : 0;
+    const int row   = table_rows != nullptr ? table_rows[batch] : 0;
+    const std::int32_t* column = indices + static_cast<std::size_t>(row) * logical_pages;
+    const int p = positions[i];
+    out[i] = column[p / kPagedKVPageSize] * kPagedKVPageSize + p % kPagedKVPageSize;
 }
 
 #ifdef NINFER_VOLTA_BUILD
@@ -564,12 +570,16 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
 }
 
 void gqa_remap_positions_launch(const Tensor& positions, const Tensor& page_indices,
-                                Tensor& out, cudaStream_t stream) {
-    const int count = positions.ne[0] * positions.ne[1];
+                                const Tensor& table_rows, Tensor& out, cudaStream_t stream) {
+    const int tokens = positions.ne[0];
+    const int count  = positions.ne[0] * positions.ne[1];
+    const auto* rows = table_rows.data == nullptr
+        ? nullptr
+        : static_cast<const std::int32_t*>(table_rows.data);
     remap_positions_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(page_indices.data),
-        static_cast<std::int32_t*>(out.data), count);
+        static_cast<const std::int32_t*>(page_indices.data), rows,
+        static_cast<std::int32_t*>(out.data), count, tokens, page_indices.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -316,9 +316,22 @@ int main() {
         parse({"ninfer-serve", "model.ninfer", "--console-log-file", "profiles/serve.log"});
     failures += check(console_log.console_log_file == "profiles/serve.log",
                       "console log file did not reach serving options");
+    const ServeOptions plain = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(plain.capture_turn_path.empty(),
+                      "one-shot turn capture must be off by default");
+    const ServeOptions capture =
+        parse({"ninfer-serve", "model.ninfer", "--capture-turn", "/tmp/turn.capture"});
+    failures += check(capture.capture_turn_path == "/tmp/turn.capture",
+                      "--capture-turn did not reach serving options");
+    bool empty_capture_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--capture-turn", ""});
+    } catch (const std::invalid_argument&) { empty_capture_rejected = true; }
+    failures += check(empty_capture_rejected, "--capture-turn accepted an empty path");
     const std::string usage = serve_usage_text("ninfer-serve");
     failures += check(usage.find("--status-line") != std::string::npos &&
                           usage.find("--console-log-file") != std::string::npos &&
+                          usage.find("--capture-turn") != std::string::npos &&
                           usage.find("--kv-park-restore-min-saving-ms") != std::string::npos,
                       "the usage text does not document the new options");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
@@ -447,6 +460,16 @@ int main() {
                           ram.ram_kv.budget_bytes == 32000000000ULL,
                       "RAM KV did not separate logical and resident capacity");
     failures += check(defaults.ram_kv.gpu_tokens == 0, "RAM KV unexpectedly enabled by default");
+    const auto lrfu = parse({"ninfer-serve", "model.ninfer", "--max-context", "262144",
+                             "--ram-kv-window", "98304", "--ram-kv-lrfu",
+                             "--ram-kv-lrfu-lambda", "0.75",
+                             "--ram-kv-lrfu-top-fraction", "0.5"});
+    failures += check(lrfu.ram_kv.lrfu && lrfu.ram_kv.lrfu_lambda == 0.75 &&
+                          lrfu.ram_kv.lrfu_top_fraction == 0.5,
+                      "LRFU flags were not parsed");
+    failures += check(!defaults.ram_kv.lrfu && defaults.ram_kv.lrfu_lambda == 0.5 &&
+                          defaults.ram_kv.lrfu_top_fraction == 0.9,
+                      "LRFU defaults changed");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

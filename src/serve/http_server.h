@@ -12,11 +12,15 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 
 namespace ninfer::serve {
+
+// One-shot raw capture of a single agent turn (see --capture-turn).
+class TurnCapture;
 
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
@@ -63,6 +67,13 @@ private:
     void run_stats_reporter();
     void stop_stats_reporter();
 
+    // Claims the process-wide one-shot capture, if --capture-turn is set and this request is an
+    // agent turn (carries tools). Returns nullptr when capture is off, already used, or the file
+    // cannot be opened; capture failures never fail the request.
+    std::shared_ptr<TurnCapture> begin_turn_capture(const httplib::Request& req,
+                                                    const GenerationRequest& request,
+                                                    std::uint64_t req_id);
+
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
@@ -74,6 +85,7 @@ private:
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
+    std::atomic<bool> capture_taken_{false};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
     std::thread stats_thread_;

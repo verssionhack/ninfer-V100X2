@@ -104,6 +104,13 @@ enum class VisionDevice : std::uint8_t {
 struct RamKvOptions {
     std::uint32_t gpu_tokens = 0;
     std::uint64_t budget_bytes = 32000000000ULL;
+    // actkv: LRFU eviction layered over the mean-key retrieval ranking. Without it each round
+    // ranks blocks by the current query alone; with it a decaying recency/frequency history keeps
+    // blocks that were relevant to earlier rounds in the resident window. `lrfu_lambda` is the
+    // decay (0..1) and `lrfu_top_fraction` the share of the window treated as the hot set.
+    bool   lrfu              = false;
+    double lrfu_lambda       = 0.5;
+    double lrfu_top_fraction = 0.9;
 };
 
 struct EngineOptions {

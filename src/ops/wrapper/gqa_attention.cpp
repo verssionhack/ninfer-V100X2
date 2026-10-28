@@ -544,8 +544,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         }
     }
     if (resident_read) {
-        if (batch_size != 1) { throw std::invalid_argument("resident GQA requires B=1"); }
-        maximum += ((static_cast<std::size_t>(max_width) * sizeof(std::int32_t) + 255) / 256 + 1) * 256;
+        // The compact position buffer is {tokens, batch}: every lane remaps its own column.
+        const std::size_t compact = static_cast<std::size_t>(max_width) *
+            static_cast<std::size_t>(batch_size) * sizeof(std::int32_t);
+        maximum += ((compact + 255) / 256 + 1) * 256;
     }
     return maximum;
 }
@@ -558,15 +560,20 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
     if (cache.read_indices.data != nullptr) {
-        if (q.ne[3] != 1 || cache.read_capacity == 0 ||
+        // The resident mappings mirror the block-table matrix: one column per concurrent lane,
+        // selected through the same kv_table_rows the attention kernels consume.
+        if (cache.read_capacity == 0 ||
             cache.read_indices.dtype != DType::I32 || cache.read_tables.dtype != DType::I32 ||
             cache.read_indices.ne[0] != cache.block_tables.ne[0] ||
-            cache.read_tables.ne[0] != cache.block_tables.ne[0]) {
+            cache.read_tables.ne[0] != cache.block_tables.ne[0] ||
+            cache.read_indices.ne[1] != cache.block_tables.ne[1] ||
+            cache.read_tables.ne[1] != cache.block_tables.ne[1]) {
             throw std::invalid_argument("gqa_attention: invalid chronological resident view");
         }
         auto remap_scope = workspace.scope();
         Tensor compact = workspace.alloc(DType::I32, {positions.ne[0], positions.ne[1]});
-        detail::gqa_remap_positions_launch(positions, cache.read_indices, compact, stream);
+        detail::gqa_remap_positions_launch(positions, cache.read_indices, kv_table_rows, compact,
+                                           stream);
         cache.block_tables = cache.read_tables;
         cache.read_indices = Tensor{};
         cache.read_tables = Tensor{};
@@ -663,7 +670,8 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     if (cache.read_indices.data != nullptr) {
         auto remap_scope = workspace.scope();
         Tensor compact = workspace.alloc(DType::I32, {positions.ne[0]});
-        detail::gqa_remap_positions_launch(positions, cache.read_indices, compact, stream);
+        detail::gqa_remap_positions_launch(positions, cache.read_indices, Tensor{}, compact,
+                                           stream);
         PagedKVLayerView resident = cache;
         resident.block_table = cache.read_table.view({cache.block_table.ne[0]});
         resident.read_indices = Tensor{};

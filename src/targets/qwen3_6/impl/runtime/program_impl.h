@@ -3412,6 +3412,9 @@ ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     sequence.kv.reset();
+    // The LRFU history is per conversation: its block scores would otherwise be folded into the
+    // first retrieval round of whatever conversation is served next on this lane.
+    sequence.lrfu.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
@@ -3617,7 +3620,8 @@ void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
 }
 
 void ProgramImplCore::refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier) {
-    if (ram_kv.gpu_tokens == 0 || frontier <= ram_kv.gpu_tokens) { return; }
+    const std::uint32_t window = ram_kv_window_tokens(sequence);
+    if (window == 0 || frontier <= window) { return; }
     std::vector<double> combined(frontier / 128, 0);
     const auto score = [&](qwen3_6::PagedKVCache& cache, DeviceContext& ctx) {
         const ScopedDevice scope(ctx.device);
@@ -3631,7 +3635,32 @@ void ProgramImplCore::refresh_ram_kv(SequenceState& sequence, std::uint32_t fron
     };
     score(decoder->text_kv, device);
     for (auto& peer : peers) { score(peer->decoder->text_kv, peer->device); }
-    const auto ranking = qwen3_6::detail::rank_ram_kv_pages(combined);
+    // actkv: fold this round's mean-key scores into a per-sequence LRFU history so blocks that
+    // mattered in earlier rounds are not evicted the moment the current query looks elsewhere.
+    // With LRFU off the ranking is the raw current-round score, byte-identical to the legacy path.
+    std::vector<double> rank_scores = combined;
+    bool lrfu_round = false;
+    if (ram_kv.lrfu) {
+        if (!sequence.lrfu) {
+            sequence.lrfu = kvmem::LrfuHistory(ram_kv.lrfu_lambda, ram_kv.lrfu_top_fraction);
+        }
+        auto& lrfu = *sequence.lrfu;
+        lrfu.begin_round();
+        std::vector<double> round(combined.size());
+        for (std::size_t b = 0; b < combined.size(); ++b) {
+            round[b] = std::isfinite(combined[b]) ? combined[b] : 0.0;
+        }
+        lrfu.preview(round);
+        rank_scores.resize(combined.size());
+        for (std::size_t b = 0; b < rank_scores.size(); ++b) { rank_scores[b] = lrfu.score(b); }
+        lrfu_round = true;
+    }
+    // The trace reports the top of the ranking actually applied, so it stays meaningful with
+    // LRFU off (where it is this round's raw mean-key top score).
+    const double top_score = rank_scores.empty()
+        ? 0.0
+        : *std::max_element(rank_scores.begin(), rank_scores.end());
+    const auto ranking = qwen3_6::detail::rank_ram_kv_pages(rank_scores);
     sequence.kv->text.prefer_pages(ranking);
     if (sequence.kv->backend) { sequence.kv->backend->prefer_pages(ranking); }
     for (auto& peer : peers) {
@@ -3640,11 +3669,22 @@ void ProgramImplCore::refresh_ram_kv(SequenceState& sequence, std::uint32_t fron
             sequence.kv->backend_peers[peer->rank - 1]->prefer_pages(ranking);
         }
     }
+    // Commit only once the ranking has been applied, so a throw above leaves history untouched.
+    if (lrfu_round) { sequence.lrfu->commit(); }
     sequence.ram_rank_frontier = frontier;
     if (std::getenv("NINFER_RAM_KV_TRACE")) {
-        std::fprintf(stderr, "RAM_KV_RETRIEVAL frontier=%u blocks=%zu query=%zu:%zu\n",
-            frontier, combined.size(), sequence.ram_query.begin, sequence.ram_query.count);
+        std::fprintf(stderr, "RAM_KV_RETRIEVAL frontier=%u blocks=%zu query=%zu:%zu lrfu=%d top=%.4f\n",
+            frontier, combined.size(), sequence.ram_query.begin, sequence.ram_query.count,
+            lrfu_round ? 1 : 0, top_score);
     }
+}
+
+std::uint32_t ProgramImplCore::ram_kv_window_tokens(const SequenceState& sequence) const noexcept {
+    if (ram_kv.gpu_tokens == 0) { return 0; }
+    const std::uint32_t window = sequence.kv
+        ? sequence.kv->text.page_entitlement() * static_cast<std::uint32_t>(kPagedKVPageSize)
+        : 0U;
+    return window != 0 ? window : ram_kv.gpu_tokens;
 }
 
 void ProgramImplCore::vision_swap_evict_hook(void* self, std::size_t bytes) {
@@ -4359,6 +4399,9 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    // A full reset starts a new conversation (an appended frontier keeps the sequence intact and
+    // never reaches here), so the per-conversation LRFU history must not carry over.
+    sequence.lrfu.reset();
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -4413,9 +4456,14 @@ void ProgramImplCore::prepare_graphs() {
                 for (std::size_t p = 0; p < indices.size(); ++p) {
                     indices[p] = static_cast<std::int32_t>(p % pool.page_group_count());
                 }
-                CUDA_CHECK(cudaMemcpyAsync(pool.read_indices().data, indices.data(),
+                // The read mappings are {logical_pages, table_rows}; each comparison row occupies
+                // its own contiguous column.
+                const std::size_t column = static_cast<std::size_t>(row) * pool.logical_page_capacity();
+                auto* indices_base = static_cast<std::int32_t*>(pool.read_indices().data) + column;
+                auto* tables_base  = static_cast<std::int32_t*>(pool.read_tables().data) + column;
+                CUDA_CHECK(cudaMemcpyAsync(indices_base, indices.data(),
                                            indices.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(pool.read_tables().data, repeated.data(),
+                CUDA_CHECK(cudaMemcpyAsync(tables_base, repeated.data(),
                                            repeated.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
             }
         }
@@ -5335,11 +5383,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                            : std::nullopt);
             // Capture Q once on the final suffix, then replay from the SAME recurrent state
             // with query-selected history. The preview does not sample or publish tokens.
-            if (ram_kv.gpu_tokens != 0 && final_candidate && staged.cursor > ram_kv.gpu_tokens) {
+            if (const std::uint32_t window = ram_kv_window_tokens(sequence);
+                window != 0 && final_candidate && staged.cursor > window) {
+                // RAM-KV reserves one scratch linear-state slot beyond the per-lane roles, so the
+                // preview can run from the current lane state and be rolled back without
+                // disturbing a concurrent lane's state.
+                const auto lane_slot = LinearStateSlots::current_state_slot(
+                    sequence.lane, max_concurrency);
+                const auto scratch_slot = LinearStateSlots::state_slot_count(max_concurrency);
                 const auto copy_state = [&](bool restore) {
                     const auto copy = [&](qwen3_6::DecoderState& state, DeviceContext& ctx) {
                         const ScopedDevice scope(ctx.device);
-                        state.linear_attention.copy_slot(restore ? 2 : 0, restore ? 0 : 2, ctx.stream);
+                        state.linear_attention.copy_slot(restore ? scratch_slot : lane_slot,
+                            restore ? lane_slot : scratch_slot, ctx.stream);
                     };
                     copy(*decoder, device);
                     for (auto& peer : peers) { copy(*peer->decoder, peer->device); }

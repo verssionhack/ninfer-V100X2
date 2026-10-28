@@ -103,8 +103,9 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     }
 }
 
-PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
-    : cache_(&cache), block_table_(block_table) {}
+PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table,
+                                   std::int32_t bound_row) noexcept
+    : cache_(&cache), block_table_(block_table), bound_row_(bound_row) {}
 
 std::uint32_t PagedKVCacheView::max_context() const noexcept {
     return cache_ == nullptr ? 0 : cache_->max_context();
@@ -112,21 +113,30 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
-    return cache_->layer_view(layer, block_table_);
+    return cache_->layer_view(layer, block_table_, bound_row_);
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocation) const {
     if (!allocation.belongs_to(pool_)) {
         throw std::invalid_argument("Paged KV allocation belongs to another cache pool");
     }
-    return PagedKVCacheView(*this, allocation.block_table());
+    return PagedKVCacheView(*this, allocation.block_table(), allocation.bound_row());
 }
 
-PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
+PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table,
+                                          std::int32_t row) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const bool quantized     = dtype_ == DType::I8;
     const std::size_t stride = quantized ? 4ULL : 2ULL;
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    // The pool's chronological mappings are {logical_pages, table_rows}; a single-lane consumer
+    // selects its own column, while batched consumers resolve rows through kv_table_rows.
+    Tensor read_indices = pool_.read_indices();
+    Tensor read_tables  = pool_.read_tables();
+    if (pool_.ram_enabled() && read_indices.ne[1] > 1) {
+        read_indices = read_indices.slice(1, row, 1);
+        read_tables  = read_tables.slice(1, row, 1);
+    }
     return PagedKVLayerView{
         .k_pages       = pool_.plane(base),
         .v_pages       = pool_.plane(base + 1),
@@ -137,8 +147,8 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .num_kv_heads  = kv_heads_,
         .dtype         = dtype_,
         .quant_group   = quant_group_,
-        .read_indices = pool_.read_indices(),
-        .read_table = pool_.read_tables(),
+        .read_indices = read_indices,
+        .read_table = read_tables,
         .read_capacity = pool_.ram_enabled() ? pool_.page_group_count() * kPagedKVPageSize : 0U,
     };
 }

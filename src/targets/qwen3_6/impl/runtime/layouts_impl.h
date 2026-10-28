@@ -676,9 +676,9 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         if constexpr (TextConfig::query_heads != 24) {
             throw std::invalid_argument("RAM KV is supported only by the 27B package");
         }
-        if (options.tp > 2 || options.max_concurrency != 1 || options.enable_vision ||
-            options.speculative.backend == SpeculativeBackend::DFlash || device.sm() != 70) {
-            throw std::invalid_argument("RAM KV requires SM70 TP1/TP2, one Text/MTP request");
+        if (options.tp > 2 || options.speculative.backend == SpeculativeBackend::DFlash ||
+            device.sm() != 70) {
+            throw std::invalid_argument("RAM KV requires SM70 27B TP1/TP2 Text/MTP (not DFlash)");
         }
         if (options.ram_kv.gpu_tokens % kPagedKVPageSize != 0 ||
             options.ram_kv.gpu_tokens < options.prefill_chunk * (options.pp == 2 ? options.pipeline_chunks : 1U) + 8192 ||
@@ -688,6 +688,17 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
             options.kv_capacity.explicit_tokens != options.ram_kv.gpu_tokens) {
             throw std::invalid_argument("RAM KV requires kv_capacity equal to its GPU window");
+        }
+        // The resident window is one GPU pool split evenly across lanes, so each lane must still
+        // hold a full prefill wave plus the archival margin.
+        const std::uint32_t lanes = std::max<std::uint32_t>(1, options.max_concurrency);
+        const std::uint32_t per_lane_tokens =
+            (options.ram_kv.gpu_tokens / lanes / kPagedKVPageSize) * kPagedKVPageSize;
+        const std::uint32_t lane_floor =
+            options.prefill_chunk * (options.pp == 2 ? options.pipeline_chunks : 1U) + 8192U;
+        if (per_lane_tokens < lane_floor) {
+            throw std::invalid_argument(
+                "RAM KV GPU window is too small for max_concurrency: each concurrent lane needs at least prefill_chunk+8192 tokens of the shared window");
         }
     }
     // Each retained message boundary costs a full per-rank recurrent-state copy; the Server caps

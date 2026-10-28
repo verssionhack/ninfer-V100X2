@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -21,6 +23,27 @@
 #include <utility>
 
 namespace ninfer::serve {
+
+// One-shot raw capture of a single agent turn. The file opens truncated when the turn is claimed
+// and receives, in order: the inbound JSON, then the exact response bytes the socket got. Appends
+// are serialized because the chunked-content provider writes from the connection's thread.
+class TurnCapture {
+public:
+    explicit TurnCapture(const std::string& path)
+        : file_(path, std::ios::binary | std::ios::trunc) {
+        if (!file_) { throw std::runtime_error("cannot open capture file " + path); }
+    }
+    void append(std::string_view bytes) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (!file_) { return; }
+        file_.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        file_.flush();
+    }
+private:
+    std::mutex mutex_;
+    std::ofstream file_;
+};
+
 namespace {
 
 struct StreamingRequest {
@@ -31,6 +54,8 @@ struct StreamingRequest {
     LiveRequestLease lease;
     std::atomic<bool> cancelled{false};
     bool started = false;
+    // Set only on the captured turn; every SSE item written to the socket is teed here.
+    std::shared_ptr<TurnCapture> capture;
 };
 
 class ClientDisconnected final : public std::exception {
@@ -45,6 +70,7 @@ void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
+    if (request.capture) { request.capture->append(item); }
 }
 
 void set_owned_content(httplib::Response& response, std::string body,
@@ -565,6 +591,65 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     }
 }
 
+namespace {
+
+std::string wall_clock_stamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto millis =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    const std::time_t seconds = static_cast<std::time_t>(millis / 1000);
+    std::tm local{};
+    localtime_r(&seconds, &local);
+    char buffer[32] = {};
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &local);
+    return std::string(buffer) + "." + std::to_string(millis % 1000);
+}
+
+std::string capture_footer(std::string_view stop_reason, std::size_t tool_calls) {
+    return "\n<<< capture end: stop_reason=" + std::string(stop_reason) +
+           " tool_calls=" + std::to_string(tool_calls) + " >>>\n";
+}
+
+std::string capture_error_footer(std::string_view message) {
+    return "\n<<< capture end: error=" + std::string(message) + " >>>\n";
+}
+
+std::string capture_preamble(const httplib::Request& req, const GenerationRequest& request,
+                             std::uint64_t req_id) {
+    std::string out = "=== ninfer-serve capture: one Anthropic /v1/messages turn ===\n";
+    out += "time: " + wall_clock_stamp() + "\n";
+    out += "request: " + std::to_string(req_id) + "\n";
+    out += "path: " + req.path + "\n";
+    out += std::string("stream: ") + (request.stream ? "yes" : "no") + "\n";
+    out += "messages: " + std::to_string(request.messages.size()) + "\n";
+    out += "tools: " + std::to_string(request.tools.size()) + "\n";
+    out += "request body bytes: " + std::to_string(req.body.size()) + "\n";
+    out += "--- request body ---\n";
+    out += req.body;
+    out += "\n--- response ---\n";
+    return out;
+}
+
+} // namespace
+
+std::shared_ptr<TurnCapture> HttpServer::begin_turn_capture(const httplib::Request& req,
+                                                            const GenerationRequest& request,
+                                                            std::uint64_t req_id) {
+    if (options_.capture_turn_path.empty() || !request.uses_tools()) { return nullptr; }
+    bool expected = false;
+    if (!capture_taken_.compare_exchange_strong(expected, true)) { return nullptr; }
+    try {
+        auto capture = std::make_shared<TurnCapture>(options_.capture_turn_path);
+        capture->append(capture_preamble(req, request, req_id));
+        log_line("capture: raw turn req=" + std::to_string(req_id) + " -> " +
+                 options_.capture_turn_path);
+        return capture;
+    } catch (const std::exception& e) {
+        log_line(std::string("capture: disabled: ") + e.what());
+        return nullptr;
+    }
+}
+
 void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json body;
     try {
@@ -597,6 +682,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    const std::shared_ptr<TurnCapture> capture = begin_turn_capture(req, request, req_id);
     LiveRequestLease live_lease(service_->live_status(), req_id, request.media_item_count(),
                                 "anthropic_messages", request.stream, request.uses_tools(),
                                 request.enable_thinking.value_or(options_.enable_thinking));
@@ -608,6 +694,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
+        if (capture) { capture->append(capture_error_footer(e.error().message)); }
         write_messages_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -617,6 +704,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         error.message = e.what();
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, error));
+        if (capture) { capture->append(capture_error_footer(e.what())); }
         write_messages_error(res, error);
         return;
     }
@@ -638,15 +726,20 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             const CompletionUsage usage = outcome.usage();
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-            set_owned_content(res,
-                              make_messages_response(id, model, outcome.text, outcome.reasoning,
-                                                     outcome.tool_calls, stop_reason, usage),
-                              prepared.lifetime);
+            std::string body = make_messages_response(id, model, outcome.text, outcome.reasoning,
+                                                      outcome.tool_calls, stop_reason, usage);
+            if (capture) {
+                capture->append(body);
+                capture->append(capture_footer(stop_reason, outcome.tool_calls.size()));
+            }
+            set_owned_content(res, std::move(body), prepared.lifetime);
         } catch (const ApiException& e) {
             log_request_error(log_context, e.error().message);
+            if (capture) { capture->append(capture_error_footer(e.error().message)); }
             write_messages_error(res, e.error());
         } catch (const std::exception& e) {
             log_request_error(log_context, e.what());
+            if (capture) { capture->append(capture_error_footer(e.what())); }
             ApiError error;
             error.status  = 500;
             error.type    = "internal_error";
@@ -658,6 +751,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     auto stream             = std::make_shared<StreamingRequest>(std::move(prepared));
     stream->lease            = std::move(live_lease);
+    stream->capture          = capture;
     const bool tool_capable = stream->prepared.tool_capable;
 
     res.set_header("Cache-Control", "no-cache");
@@ -761,13 +855,20 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 write_stream_item(sink, *stream,
                                   make_message_delta(stop_reason, outcome.usage()));
                 write_stream_item(sink, *stream, make_message_stop());
+                if (stream->capture) {
+                    stream->capture->append(capture_footer(stop_reason, outcome.tool_calls.size()));
+                }
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& e) {
                 log_request_error(log_context, e.what());
+                if (stream->capture) { stream->capture->append(capture_error_footer(e.what())); }
                 return false;
             } catch (const ApiException& e) {
                 log_request_error(log_context, e.error().message);
+                if (stream->capture) {
+                    stream->capture->append(capture_error_footer(e.error().message));
+                }
                 try {
                     write_stream_item(sink, *stream, messages_sse_error_event(e.error()));
                     sink.done();
@@ -775,6 +876,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& e) {
                 log_request_error(log_context, e.what());
+                if (stream->capture) { stream->capture->append(capture_error_footer(e.what())); }
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";

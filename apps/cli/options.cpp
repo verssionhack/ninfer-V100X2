@@ -133,6 +133,7 @@ std::string usage_text(const char* argv0) {
            "       [--device N] [--tp 1|2|4] [--pp 1|2] [--pipeline-chunks 1..8] [--devices N,...] [--storage-device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--ram-kv-window N] [--ram-kv-budget-bytes N]\n"
+           "       [--ram-kv-lrfu [--ram-kv-lrfu-lambda F] [--ram-kv-lrfu-top-fraction F]]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -152,6 +153,8 @@ std::string usage_text(const char* argv0) {
            "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
+           "--ram-kv-lrfu ranks resident pages by a decaying recency/frequency history instead of the current\n"
+           "query alone (lambda 0..1, default 0.5; top-fraction (0,1], default 0.9); no-op without --ram-kv-window.\n"
            "--boundary-checkpoints retains a reusable checkpoint at the last stable message boundary.\n"
            "--shared-prefix retains one after the static leading system/tools block for cross-session reuse.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (default 32768),\n"
@@ -232,6 +235,14 @@ Options parse_options(int argc, char** argv) {
             options.ram_kv.gpu_tokens = parse_u32(value(arg), "ram-kv-window");
         } else if (arg == "--ram-kv-budget-bytes") {
             options.ram_kv.budget_bytes = parse_u64(value(arg), "ram-kv-budget-bytes");
+        } else if (arg == "--ram-kv-lrfu") {
+            options.ram_kv.lrfu = true;
+        } else if (arg == "--ram-kv-lrfu-lambda") {
+            options.ram_kv.lrfu_lambda =
+                parse_float(value(arg), "ram-kv-lrfu-lambda", 0.0F, 1.0F);
+        } else if (arg == "--ram-kv-lrfu-top-fraction") {
+            options.ram_kv.lrfu_top_fraction =
+                parse_float(value(arg), "ram-kv-lrfu-top-fraction", 0.0F, 1.0F);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -361,6 +372,11 @@ Options parse_options(int argc, char** argv) {
     if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
+    if (!(options.ram_kv.lrfu_lambda >= 0.0 && options.ram_kv.lrfu_lambda <= 1.0) ||
+        !(options.ram_kv.lrfu_top_fraction > 0.0 && options.ram_kv.lrfu_top_fraction <= 1.0)) {
+        throw std::invalid_argument(
+            "--ram-kv-lrfu-lambda must be in [0,1] and --ram-kv-lrfu-top-fraction in (0,1]");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_max_tokens == kUnlimitedVisionTokens && options.enable_vision &&

@@ -133,10 +133,12 @@ std::string serve_usage_text(const char* argv0) {
            "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--request-log-jsonl FILE] [--console-log-file FILE] "
+           "[--request-log-jsonl FILE] [--console-log-file FILE] [--capture-turn FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
-           "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
+           "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
+           "[--ram-kv-lrfu [--ram-kv-lrfu-lambda F] [--ram-kv-lrfu-top-fraction F]] "
+           "[--kv-park-bytes N] "
            "[--default-max-tokens N] "
            "[--vision] [--vision-max-tokens N|unlimited] [--vision-device gpu|cpu] "
            "[--vision-kv-swap] [--boundary-checkpoints [--boundary-history N]] "
@@ -157,7 +159,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --volta-long-attention: experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ\n"
            "       --volta-fast-decode: experimental QUASAR TP2 NVFP4 FP32 epilogues and packed MTP W8;\n"
            "       may be combined with --vision; output may differ.\n"
-           "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; one SM70 27B Text/MTP request, TP1/TP2/PP2\n"
+           "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; SM70 27B Text/MTP, TP1/TP2/PP2;\n"
+           "       the GPU window is one pool shared evenly by --max-concurrency lanes\n"
+           "       --ram-kv-lrfu: rank resident pages by a decaying recency/frequency history instead of the\n"
+           "       current query alone (lambda 0..1, default 0.5; top-fraction (0,1], default 0.9);\n"
+           "       no-op without --ram-kv-window\n"
            "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
            "       --kv-park-bytes moves a replaced conversation's KV to host memory instead of dropping it,\n"
            "       so it resumes without a re-prefill; a byte budget, 0 (default) disables parking\n"
@@ -172,6 +178,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --console-log-file appends plain log lines (never the live status redraws), so a\n"
            "       terminal keeps the in-place status line while the file stays line-oriented\n"
+           "       --capture-turn writes the first tool-bearing Anthropic /v1/messages turn (request\n"
+           "       JSON plus the exact response bytes) to FILE once, then stops capturing\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -309,6 +317,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.ram_kv.gpu_tokens == 0) { throw std::invalid_argument("RAM KV window must be positive"); }
         } else if (arg == "--ram-kv-budget-bytes") {
             options.ram_kv.budget_bytes = parse_u64(require_value("--ram-kv-budget-bytes"), "ram-kv-budget-bytes");
+        } else if (arg == "--ram-kv-lrfu") {
+            options.ram_kv.lrfu = true;
+        } else if (arg == "--ram-kv-lrfu-lambda") {
+            options.ram_kv.lrfu_lambda = parse_float_in(
+                require_value("--ram-kv-lrfu-lambda"), "ram-kv-lrfu-lambda", 0.0f, 1.0f);
+        } else if (arg == "--ram-kv-lrfu-top-fraction") {
+            options.ram_kv.lrfu_top_fraction = parse_float_in(
+                require_value("--ram-kv-lrfu-top-fraction"), "ram-kv-lrfu-top-fraction", 0.0f, 1.0f);
         } else if (arg == "--kv-park-bytes") {
             options.kv_park_bytes = parse_u64(require_value("--kv-park-bytes"), "kv-park-bytes");
         } else if (arg == "--max-concurrency") {
@@ -372,6 +388,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.console_log_file = require_value("--console-log-file");
             if (options.console_log_file.empty()) {
                 throw std::invalid_argument("--console-log-file must not be empty");
+            }
+        } else if (arg == "--capture-turn") {
+            options.capture_turn_path = require_value("--capture-turn");
+            if (options.capture_turn_path.empty()) {
+                throw std::invalid_argument("--capture-turn must not be empty");
             }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
@@ -584,6 +605,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
+    if (!(options.ram_kv.lrfu_lambda >= 0.0 && options.ram_kv.lrfu_lambda <= 1.0) ||
+        !(options.ram_kv.lrfu_top_fraction > 0.0 && options.ram_kv.lrfu_top_fraction <= 1.0)) {
+        throw std::invalid_argument(
+            "--ram-kv-lrfu-lambda must be in [0,1] and --ram-kv-lrfu-top-fraction in (0,1]");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
