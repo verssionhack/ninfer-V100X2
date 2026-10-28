@@ -30,6 +30,10 @@ struct LiveRequestSnapshot {
     std::uint64_t fingerprint  = 0;
     std::string protocol;
     bool stream                = false;
+    // What this generation is for, so the status line can tag a decoding request: whether it was
+    // sent with tools and whether thinking/reasoning is on. Both are the effective request values.
+    bool has_tools             = false;
+    bool thinking              = false;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t media_total  = 0;
     std::uint32_t media_done   = 0;
@@ -55,7 +59,8 @@ class LiveRequestRegistry {
 public:
     explicit LiveRequestRegistry(std::size_t capacity = 0) : capacity_(capacity) {}
 
-    void begin(std::uint64_t http_id, std::size_t media_total, std::string protocol, bool stream);
+    void begin(std::uint64_t http_id, std::size_t media_total, std::string protocol, bool stream,
+             bool has_tools, bool thinking);
     void bind_engine(std::uint64_t http_id, std::uint64_t engine_id, std::uint32_t prompt_tokens,
                      std::uint64_t fingerprint);
     void media_tick(std::uint64_t http_id, MediaPhase phase, std::size_t done, std::size_t total);
@@ -79,7 +84,8 @@ class LiveRequestLease {
 public:
     LiveRequestLease() noexcept = default;
     LiveRequestLease(std::shared_ptr<LiveRequestRegistry> registry, std::uint64_t http_id,
-                     std::size_t media_total, std::string protocol, bool stream);
+                     std::size_t media_total, std::string protocol, bool stream, bool has_tools,
+                     bool thinking);
     ~LiveRequestLease();
 
     LiveRequestLease(LiveRequestLease&& other) noexcept;

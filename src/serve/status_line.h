@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -33,10 +34,12 @@ struct StatusSnapshot {
     std::optional<LiveRequestSnapshot> prefill;
     // Oldest request still in host-side preparation (media acquisition/preprocessing), if any.
     std::optional<LiveRequestSnapshot> preparing;
-    // Decode rate over the reporter's own sampling window (the committed counter advances every
-    // round, so it never quantizes). Prefill speed is not stored here: the engine publishes it in
-    // `stats.prefill_tokens_per_second`, measured where the prefill work runs.
-    double decode_rate_tok_s  = 0.0;
+    // Resolved live snapshot for each entry in `stats.decode_requests`, by index. An entry that
+    // has no serve-side registration (the engine started the lane before the id was bound) is
+    // std::nullopt. Decode and prefill speeds are not stored here: the engine publishes them in
+    // `stats.decode_tokens_per_second` / `stats.prefill_tokens_per_second`, measured where the work
+    // runs.
+    std::vector<std::optional<LiveRequestSnapshot>> decodes;
     std::uint64_t uptime_seconds = 0;
 };
 
@@ -67,9 +70,6 @@ private:
     bool stopping_ = false;
     bool started_  = false;
 
-    std::uint64_t last_decode_tokens_    = 0;
-    std::chrono::steady_clock::time_point last_decode_time_;
-    double decode_rate_                  = 0.0;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point last_log_;
 };

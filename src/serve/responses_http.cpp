@@ -233,7 +233,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::uint64_t req_id = ++request_seq_;
     LiveRequestLease live_lease(service_->live_status(), req_id,
                                 request.generation.media_item_count(), "openai_responses",
-                                request.stream);
+                                request.stream, request.generation.uses_tools(),
+                                request.generation.enable_thinking.value_or(
+                                    options_.enable_thinking));
     PreparedRequest prepared;
     try {
         prepared =

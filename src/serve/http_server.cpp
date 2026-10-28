@@ -380,7 +380,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     const std::uint64_t req_id = ++request_seq_;
     LiveRequestLease live_lease(service_->live_status(), req_id, request.media_item_count(),
-                                "openai_chat_completions", request.stream);
+                                "openai_chat_completions", request.stream, request.uses_tools(),
+                                request.enable_thinking.value_or(options_.enable_thinking));
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
@@ -597,7 +598,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     const std::uint64_t req_id = ++request_seq_;
     LiveRequestLease live_lease(service_->live_status(), req_id, request.media_item_count(),
-                                "anthropic_messages", request.stream);
+                                "anthropic_messages", request.stream, request.uses_tools(),
+                                request.enable_thinking.value_or(options_.enable_thinking));
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(

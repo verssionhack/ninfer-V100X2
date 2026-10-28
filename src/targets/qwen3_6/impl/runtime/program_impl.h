@@ -249,6 +249,12 @@ ProgramImplCore::prefill_vision_progress(std::uint32_t lane) const noexcept {
             static_cast<std::uint32_t>(vision->items_total())};
 }
 
+bool ProgramImplCore::prefill_vision_swap(std::uint32_t lane) const noexcept {
+    if (lane >= requests.size() || !requests[lane].prefill) { return false; }
+    const std::unique_ptr<schedule::VisionPrefillSession>& vision = requests[lane].prefill->vision;
+    return vision != nullptr && vision->uses_swap();
+}
+
 double ProgramImplCore::wall_now_seconds() noexcept {
     return std::chrono::duration<double>(
                std::chrono::system_clock::now().time_since_epoch())

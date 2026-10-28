@@ -7,13 +7,15 @@
 namespace ninfer::serve {
 
 void LiveRequestRegistry::begin(std::uint64_t http_id, std::size_t media_total,
-                                std::string protocol, bool stream) {
+                                std::string protocol, bool stream, bool has_tools, bool thinking) {
     std::lock_guard lock(mutex_);
     if (capacity_ != 0 && entries_.size() >= capacity_) { return; }
     LiveRequestSnapshot entry;
     entry.http_id      = http_id;
     entry.protocol     = std::move(protocol);
     entry.stream       = stream;
+    entry.has_tools    = has_tools;
+    entry.thinking     = thinking;
     entry.media_total  = static_cast<std::uint32_t>(media_total);
     entry.accepted     = std::chrono::steady_clock::now();
     entries_[http_id]  = std::move(entry);
@@ -83,9 +85,12 @@ std::size_t LiveRequestRegistry::size() const {
 
 LiveRequestLease::LiveRequestLease(std::shared_ptr<LiveRequestRegistry> registry,
                                    std::uint64_t http_id, std::size_t media_total,
-                                   std::string protocol, bool stream)
+                                   std::string protocol, bool stream, bool has_tools,
+                                   bool thinking)
     : registry_(std::move(registry)), http_id_(http_id) {
-    if (registry_) { registry_->begin(http_id_, media_total, std::move(protocol), stream); }
+    if (registry_) {
+        registry_->begin(http_id_, media_total, std::move(protocol), stream, has_tools, thinking);
+    }
 }
 
 LiveRequestLease::~LiveRequestLease() { release(); }

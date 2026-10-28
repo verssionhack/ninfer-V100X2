@@ -202,6 +202,9 @@ public:
     // Live prefill progress for the status line: vision items encoded/needed by the lane.
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
     prefill_vision_progress(std::uint32_t lane) const noexcept;
+    // Whether the lane's prefill encodes its vision by swapping the persistent KV arena to host
+    // (the vision_kv_swap path). Worker-only; published through RuntimeStats for the status line.
+    [[nodiscard]] bool prefill_vision_swap(std::uint32_t lane) const noexcept;
     // Gauges and cumulative counters for the parked/spilled tiers.
     [[nodiscard]] KvParkStats kv_park_stats() const noexcept;
 

@@ -676,6 +676,9 @@ public:
     // ran, then publishes the result through RuntimeStats.
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
     prefill_vision_progress(std::uint32_t lane) const noexcept;
+    // Whether `lane`'s prefill encodes vision via the KV-swap path. Worker-only; published into
+    // RuntimeStats for the status line.
+    [[nodiscard]] bool prefill_vision_swap(std::uint32_t lane) const noexcept;
     // Gauges and cumulative counters for the parked/spilled tiers. Worker-owned; published into
     // RuntimeStats under the executor's stats mutex.
     [[nodiscard]] KvParkStats kv_park_stats() const noexcept;

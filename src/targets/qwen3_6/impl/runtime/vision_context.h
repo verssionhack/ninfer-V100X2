@@ -113,6 +113,9 @@ public:
     // recorded. Worker-only (the prefill owner is the sole reader).
     [[nodiscard]] std::size_t items_total() const noexcept { return plan_.uses.size(); }
     [[nodiscard]] std::size_t items_encoded() const noexcept { return items_encoded_; }
+    // True when this session encodes items by swapping the persistent KV arena to host
+    // (vision_kv_swap) rather than from resident scratch. Worker-only.
+    [[nodiscard]] bool uses_swap() const noexcept { return swap_.evict != nullptr; }
 
 private:
     DeviceContext& device_;

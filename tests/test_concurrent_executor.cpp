@@ -356,6 +356,7 @@ public:
     prefill_vision_progress(std::uint32_t) const noexcept {
         return {0, 0};
     }
+    [[nodiscard]] bool prefill_vision_swap(std::uint32_t) const noexcept { return false; }
     [[nodiscard]] ninfer::KvParkStats kv_park_stats() const noexcept { return {}; }
     void pump_parked_io() noexcept {}
     [[nodiscard]] bool parked_io_pending() const noexcept { return false; }

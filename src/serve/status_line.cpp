@@ -74,11 +74,68 @@ std::string format_eta(double seconds) {
     return out.str();
 }
 
+// A "percentage bar": kWidth cells stand for 0..100%, filled left to right with Unicode block
+// elements at one-eighth-cell precision so the fill tracks the percentage closely. The fill is the
+// DONE fraction (progress); the percentage and done/total count on the right still report the
+// work. Cell levels 1..8 are the block elements, and an empty cell is a space.
 std::string progress_bar(double percent) {
-    constexpr std::size_t kWidth = 24;
-    const std::size_t filled =
-        static_cast<std::size_t>(std::clamp(percent, 0.0, 100.0) / 100.0 * kWidth);
-    return std::string(filled, '#') + std::string(kWidth - filled, '-');
+    constexpr std::size_t kWidth = 10;
+    // ▏▎▍▌▋▊▉█ (U+258F..U+2588) as UTF-8 bytes: one-eighth-cell fill levels, least to most.
+    const std::string kLevels = "\xE2\x96\x8F\xE2\x96\x8E\xE2\x96\x8D\xE2\x96\x8C"
+                                "\xE2\x96\x8B\xE2\x96\x8A\xE2\x96\x89\xE2\x96\x88";
+    const double clamped = std::clamp(percent, 0.0, 100.0);
+    const int total_eighths =
+        static_cast<int>(std::lround(clamped / 100.0 * static_cast<double>(kWidth) * 8.0));
+    std::string bar;
+    bar.reserve(kWidth * 3);
+    for (std::size_t cell = 0; cell < kWidth; ++cell) {
+        const int level = std::clamp(total_eighths - static_cast<int>(cell) * 8, 0, 8);
+        bar += level == 0 ? " " : kLevels.substr(static_cast<std::size_t>((level - 1) * 3), 3);
+    }
+    return bar;
+}
+
+// The largest prefix of `line` of at most `max_bytes` that ends on a UTF-8 character boundary, so
+// truncation never splits one of the wide progress-bar block characters.
+std::size_t utf8_prefix_boundary(const std::string& line, std::size_t max_bytes) {
+    if (line.size() <= max_bytes) { return line.size(); }
+    std::size_t cut = max_bytes;
+    // A UTF-8 continuation byte is 0b10xxxxxx; back up past any run so the cut lands on a leading
+    // byte (or the start), keeping every emitted character intact.
+    while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0U) == 0x80U) { --cut; }
+    return cut;
+}
+
+// Compact tag for what a decoding request is generating: tools and/or thinking, or plain text.
+std::string decode_kind_tag(const LiveRequestSnapshot* request) {
+    std::string tag;
+    if (request != nullptr) {
+        if (request->has_tools) { tag = "tools"; }
+        if (request->thinking) { tag += (tag.empty() ? "think" : "+think"); }
+    }
+    return tag.empty() ? "text" : tag;
+}
+
+// The KV switch a prefill performs, as a `PrefixReusePath` value: how it obtains its KV other than
+// a fresh prefill (FullReset) or a plain append (AppendAtFrontier). RestoreParkedKv/ShareLanePrefix
+// bring back or borrow state that already exists; the checkpoint paths restore from a saved image.
+// The no-switch cases render no tag.
+std::string prefill_kv_tag(std::uint8_t reuse_path) {
+    using ninfer::PrefixReusePath;
+    switch (static_cast<PrefixReusePath>(reuse_path)) {
+    case PrefixReusePath::RestoreTurnCheckpoint:
+        return "turn";
+    case PrefixReusePath::RestoreResponseCheckpoint:
+        return "resp";
+    case PrefixReusePath::RestoreParkedKv:
+        return "park";
+    case PrefixReusePath::ShareLanePrefix:
+        return "share";
+    case PrefixReusePath::FullReset:
+    case PrefixReusePath::AppendAtFrontier:
+        return "";
+    }
+    return "";
 }
 
 const char* media_phase_name(MediaPhase phase) {
@@ -135,15 +192,26 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
         } else {
             out << '-';
         }
-        const std::uint32_t total = stats.prefill_prompt_tokens;
-        const std::uint32_t done  = stats.prefill_processed_tokens;
-        const double percent =
-            total != 0 ? 100.0 * static_cast<double>(std::min(done, total)) / total : 0.0;
-        out << " prefill [" << progress_bar(percent) << "] " << std::fixed << std::setprecision(1)
-            << percent << "% " << done << '/' << total;
+        // The prefill bar tracks the *new* work this run does: the reused prefix is already resident, so
+        // progress runs from `start` to `total` and reads 0% at the start and 100% at the end even
+        // for a resume that began partway. A fresh prompt (start == 0) spans the whole prompt.
+        const std::uint32_t total  = stats.prefill_prompt_tokens;
+        const std::uint32_t done   = std::min(stats.prefill_processed_tokens, total);
+        const std::uint32_t start  = std::min(stats.prefill_start_tokens, total);
+        const std::uint32_t work_total = total - start;                     // new tokens to prefill
+        const std::uint32_t work_done  = done > start ? done - start : 0;
+        const double percent = work_total != 0
+            ? 100.0 * static_cast<double>(std::min(work_done, work_total)) / work_total
+            : 0.0;
+        out << " prefill [" << progress_bar(percent) << "] " << std::fixed
+            << std::setprecision(1) << percent << "% " << work_done << '/' << work_total;
+        const std::string kv_tag = prefill_kv_tag(stats.prefill_reuse_path);
+        if (!kv_tag.empty()) {
+            out << " kv=" << kv_tag;
+        }
         const double prefill_rate = stats.prefill_tokens_per_second;
         if (prefill_rate > 0.5) {
-            out << ' ' << format_rate(prefill_rate) << " tok/s";
+            out << ' ' << format_rate(prefill_rate) << " t/s";
             if (total > done) {
                 out << " eta "
                     << format_eta(static_cast<double>(total - done) / prefill_rate);
@@ -159,16 +227,49 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
             << request.media_total;
         wrote_work = true;
     }
+    // One progress bar per decoding request, mirroring the prefill readout: a done/budget bar that
+    // fills toward max_tokens, the generated/budget count on the right, the instant decode rate,
+    // and a tag for what the request is generating.
+    for (std::uint32_t i = 0; i < stats.decode_request_count; ++i) {
+        const ninfer::DecodeRequestStats& dreq = stats.decode_requests[i];
+        const LiveRequestSnapshot* dreq_snap =
+            (i < snapshot.decodes.size() && snapshot.decodes[i].has_value())
+                ? &snapshot.decodes[i].value()
+                : nullptr;
+        if (wrote_work) { out << " | "; }
+        out << "decode req=";
+        if (dreq_snap != nullptr) {
+            out << dreq_snap->http_id;
+        } else {
+            out << '?';
+        }
+        const std::uint32_t total = dreq.budget_tokens;
+        const std::uint32_t done  = dreq.generated_tokens;
+        const double percent =
+            total != 0 ? 100.0 * static_cast<double>(std::min(done, total)) / total : 0.0;
+        out << " [" << progress_bar(percent) << "] " << std::fixed << std::setprecision(1)
+            << percent << "% " << done << '/' << total;
+        if (stats.decode_tokens_per_second > 0.5) {
+            out << ' ' << format_rate(stats.decode_tokens_per_second) << " t/s";
+        }
+        out << ' ' << decode_kind_tag(dreq_snap);
+        wrote_work = true;
+    }
     if (!wrote_work) { out << "idle"; }
 
     if (stats.prefill_vision_total != 0) {
         out << " vis " << stats.prefill_vision_done << '/' << stats.prefill_vision_total;
+        if (stats.prefill_vision_swap != 0) {
+            // The vision items are encoded by swapping the persistent KV arena to host, which the
+            // operator wants visible next to the count.
+            out << " swap";
+        }
     }
 
     out << " | run=" << stats.running_requests << " pref=" << stats.prefilling_requests
         << " ready=" << stats.decode_ready_requests << " wait=" << stats.waiting_requests
-        << " d/p=" << format_rate(snapshot.decode_rate_tok_s) << '/'
-        << format_rate(stats.prefill_tokens_per_second) << " tok/s";
+        << " d/p=" << format_rate(stats.decode_tokens_per_second) << '/'
+        << format_rate(stats.prefill_tokens_per_second) << " t/s";
 
     const ninfer::KvParkStats& kv = stats.kv_park;
     if (kv.ram_budget != 0 || kv.ram_entries != 0 || kv.disk_budget != 0 ||
@@ -190,8 +291,7 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
 }
 
 StatusLineReporter::StatusLineReporter(GenerationService& service, StatusLineOptions options)
-    : service_(service), options_(options), last_decode_time_(Clock::now()),
-      started_at_(Clock::now()), last_log_(Clock::now()) {}
+    : service_(service), options_(options), started_at_(Clock::now()), last_log_(Clock::now()) {}
 
 StatusLineReporter::~StatusLineReporter() { stop(); }
 
@@ -256,24 +356,21 @@ void StatusLineReporter::render_once() {
         }
     }
 
-    const double decode_dt = std::chrono::duration<double>(now - last_decode_time_).count();
-    if (decode_dt > 0.001 && stats.committed_decode_tokens >= last_decode_tokens_) {
-        const double instantaneous =
-            static_cast<double>(stats.committed_decode_tokens - last_decode_tokens_) / decode_dt;
-        decode_rate_ = 0.3 * instantaneous + 0.7 * decode_rate_;
-        if (instantaneous == 0.0) { decode_rate_ *= 0.7; }
+    // Resolve each decode-ready request's live snapshot (http id, tools/thinking) by engine id,
+    // so the formatter can name the request and tag what it is generating.
+    snapshot.decodes.resize(stats.decode_request_count);
+    for (std::uint32_t i = 0; i < stats.decode_request_count; ++i) {
+        snapshot.decodes[i] = live->find_by_engine(stats.decode_requests[i].engine_id);
     }
-    last_decode_tokens_ = stats.committed_decode_tokens;
-    last_decode_time_   = now;
 
-    snapshot.decode_rate_tok_s = decode_rate_;
-    snapshot.uptime_seconds     = static_cast<std::uint64_t>(
+    snapshot.uptime_seconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(now - started_at_).count());
 
     std::string line = format_status_line(snapshot, !options_.interactive);
     if (options_.interactive) {
         const std::size_t width = terminal_width();
-        if (line.size() > width) { line.resize(width); }
+        const std::size_t cut = utf8_prefix_boundary(line, width);
+        if (cut < line.size()) { line.resize(cut); }
         set_console_status_line(line);
     } else if (now - last_log_ >= options_.log_interval) {
         write_console_log(ConsoleLogLevel::Info, line);

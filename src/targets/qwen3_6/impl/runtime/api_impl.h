@@ -270,6 +270,11 @@ Program<Variant>::prefill_vision_progress(std::uint32_t lane) const noexcept {
 }
 
 template <>
+bool Program<Variant>::prefill_vision_swap(std::uint32_t lane) const noexcept {
+    return impl_->prefill_vision_swap(lane);
+}
+
+template <>
 KvParkStats Program<Variant>::kv_park_stats() const noexcept {
     return impl_->kv_park_stats();
 }

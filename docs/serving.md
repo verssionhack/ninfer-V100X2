@@ -939,20 +939,37 @@ measured values used on unusual storage.
 `--status-line` adds an operator-facing live line on stderr:
 
 ```
-status req=42 fp=9f3a1c07 prefill [########----------------] 58.5% 8192/14000 1.14k tok/s
-       eta 5.1s vis 1/4 | run=2 pref=1 ready=1 wait=0 d/p=18/1.14k tok/s
+status req=42 fp=9f3a1c07 prefill [█████▉    ] 58.5% 8192/14000 kv=park 1.14k t/s
+       eta 5.1s vis 1/4 swap | decode req=7 [████▌     ] 45.0% 115/256 18 t/s tools+think
+       | run=2 pref=1 ready=1 wait=0 d/p=18/1.14k t/s
        | kv ram 12.0G/16.0G e=7 disk 41.0G/64.0G e=13 hit=4 spill=9 evict=3 up=01:02:13
 ```
 
 `req` is the monotonic HTTP request id, `fp` the low eight hex digits of an FNV-1a-64 over the
-prepared token ids (stable across protocols that render the same conversation), the media
-section reports host-side acquisition/preprocessing plus vision items encoded during prefill, and
-`d/p` shows the current decode and prefill token rates. The prefill rate is measured by the engine
-around each prefill step -- processed tokens over the wall time since the previous step finished,
-so decode rounds interleaved by the scheduler count against prefill advance -- smoothed across
-steps and published in `RuntimeStats`. It is not differenced from the progress counter, which only
-moves when a whole chunk lands and so would report the chunk size rather than throughput; the
-prefill ETA divides the remaining tokens by that measured rate. The line is redrawn in place only when
+prepared token ids (stable across protocols that render the same conversation), and the media
+section reports host-side acquisition/preprocessing plus vision items encoded during prefill. Each
+progress bar is a fixed-width (0..100%) gauge filled left to right with Unicode block characters
+(`▏▎▍▌▋▊▉█`, one-eighth-cell precision) that fill up as the work completes: the prefill bar tracks
+only the *new* work this run does -- from the reused prefix (a cache or parked-conversation hit,
+already resident) to the end of the prompt -- so it reads 0% at the start and 100% at the end even
+for a resume that began partway (a fresh prompt spans the whole prompt), and the percentage and
+`done/total` count on the right report that new-work window. When the prefill obtains its KV by a
+non-trivial switch, a `kv=` tag names the path: `turn`/`resp` restore a turn or response
+checkpoint, `park` restores a conversation parked in host RAM or spilled to disk, and `share`
+borrows another lane's prefix; a fresh or plain-append prefill shows no tag. When the prompt's
+vision items are encoded by swapping the persistent KV arena to host (the vision-swap path), the
+vision count carries a `swap` suffix. One
+decode bar is drawn per decoding request (up to the concurrency limit): a done/budget progress bar
+against the request's output budget (max_tokens), with the generated count on the right, the
+instant decode rate, and a tag for what it is generating (`tools`, `think`, combined as
+`tools+think`, or `text`). `d/p` shows the current decode and prefill token rates. The prefill
+rate is the tokens the most recent prefill step processed divided by that step's wall time; the
+decode rate is committed tokens over a short (~250 ms) wall-clock window on the worker, so it
+reflects the sustained decode speed including the per-round overhead rather than a decode-only
+spike. Both are published in `RuntimeStats` and track the real speed; they are not differenced
+from the progress counters, which only move in chunk-sized jumps and so would report the chunk
+size rather than throughput. The prefill ETA divides the remaining tokens by the prefill rate.
+The line is redrawn in place only when
 stderr is a terminal, leaving previous logs above it; under `ninfer_tui.py` or a pipe it is
 emitted through the ordinary logger as a terminated `status ...` line at
 `--log-stats-interval-ms`, so existing line parsers keep working. Because a pipe disables the
