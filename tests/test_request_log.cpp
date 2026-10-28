@@ -356,6 +356,9 @@ int main() {
     failures +=
         check(format_request_start(context).find("preserve_thinking=on") != std::string::npos,
               "human request log omits preserve-thinking mode");
+    // The JSON checks above re-used `outcome` and left its reuse path on RestoreParkedKv; restore
+    // the value this human-format check is asserting on.
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
     failures +=
         check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
                   std::string::npos,

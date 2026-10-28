@@ -704,7 +704,7 @@ int test_streaming_events() {
     const Json stop = parse_sse(make_content_block_stop(2), &type);
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
+    const Json mdelta = parse_sse(make_message_delta("tool_use", CompletionUsage{0, 5}), &type);
     failures +=
         check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
                   mdelta.at("delta").at("stop_sequence").is_null() &&
