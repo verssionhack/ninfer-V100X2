@@ -296,9 +296,10 @@ private:
                 const std::uint32_t generated = static_cast<std::uint32_t>(request.generated.size());
                 const std::uint32_t remaining = request.budget ? request.budget->remaining() : 0;
                 snapshot.decode_requests[decode_count] = DecodeRequestStats{
-                    .engine_id        = request.id,
-                    .generated_tokens = generated,
-                    .budget_tokens    = generated + remaining,
+                    .engine_id         = request.id,
+                    .generated_tokens  = generated,
+                    .budget_tokens     = generated + remaining,
+                    .tokens_per_second = request.decode_tokens_per_second,
                 };
                 ++decode_count;
             }
@@ -307,9 +308,8 @@ private:
         // Publish the instant decode rate only while a lane is decoding; when none are, cold the
         // window too so a later decode resumes measuring from a fresh window, not a stale one.
         if (snapshot.decode_ready_requests == 0) {
-            decode_rate_window_active_ = false;
-            decode_rate_window_tokens_ = 0;
-            decode_tokens_per_second_  = 0.0;
+            decode_rate_window_       = DecodeRateWindow{};
+            decode_tokens_per_second_ = 0.0;
         }
         snapshot.decode_tokens_per_second =
             snapshot.decode_ready_requests > 0 ? decode_tokens_per_second_ : 0.0;
@@ -388,6 +388,15 @@ private:
         }
     }
 
+    // Committed-token window behind a decode rate (the engine-wide one and each request's own):
+    // tokens accumulate until the window elapses, then the rate is published and it restarts.
+    // Worker-owned.
+    struct DecodeRateWindow {
+        std::uint64_t tokens = 0;
+        Clock::time_point start{};
+        bool active = false;
+    };
+
     struct Request {
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
@@ -440,6 +449,12 @@ private:
         // request owns the lane. Reused-prefix tokens are resident before the first step and are
         // not part of any step, so they do not count.
         double prefill_tokens_per_second = 0.0;
+        // This request's own instant decode throughput: the same short-window accounting as the
+        // engine-wide decode_tokens_per_second, kept per lane, so concurrent decodes each report
+        // their own speed. Worker-owned; published in the stats snapshot as the
+        // DecodeRequestStats entry for this request.
+        double decode_tokens_per_second = 0.0;
+        DecodeRateWindow decode_rate_window{};
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -814,28 +829,34 @@ private:
         request.prefill_tokens_per_second = rate;
     }
 
-    // Record this round's contribution to the decode rate over a short wall-clock window. The
+    // Record this round's contribution to a decode rate over a short wall-clock window. The
     // window divides committed tokens by the actual time elapsed on the worker between rounds --
     // which includes the per-round bookkeeping (detokenization, batch resolution, the gap to the
     // next round) that a decode_batch-only timing excludes. That is what makes the published
     // number the real sustained decode speed instead of an unrealistically high instantaneous
     // spike. Tokens accumulate until the window elapses, then the rate is recomputed and the
-    // window restarts. Worker-owned.
-    void account_decode_rate(std::uint32_t tokens, Clock::time_point now) noexcept {
+    // window restarts. Shared by the engine-wide rate (all decoding lanes together) and each
+    // request's own rate; worker-owned.
+    static void account_decode_rate(DecodeRateWindow& window, double& published,
+                                    std::uint32_t tokens, Clock::time_point now) noexcept {
         if (tokens == 0) { return; }
-        decode_rate_window_tokens_ += tokens;
-        if (!decode_rate_window_active_) {
-            decode_rate_window_active_ = true;
-            decode_rate_window_start_  = now;
+        window.tokens += tokens;
+        if (!window.active) {
+            window.active = true;
+            window.start  = now;
             return;
         }
-        const double seconds = std::chrono::duration<double>(now - decode_rate_window_start_).count();
+        const double seconds = std::chrono::duration<double>(now - window.start).count();
         constexpr double kDecodeRateWindowSeconds = 0.25;
         if (seconds < kDecodeRateWindowSeconds) { return; }
-        const double rate = static_cast<double>(decode_rate_window_tokens_) / seconds;
-        if (std::isfinite(rate) && rate > 0.0) { decode_tokens_per_second_ = rate; }
-        decode_rate_window_tokens_ = 0;
-        decode_rate_window_start_  = now;
+        const double rate = static_cast<double>(window.tokens) / seconds;
+        if (std::isfinite(rate) && rate > 0.0) { published = rate; }
+        window.tokens = 0;
+        window.start  = now;
+    }
+
+    void account_decode_rate(std::uint32_t tokens, Clock::time_point now) noexcept {
+        account_decode_rate(decode_rate_window_, decode_tokens_per_second_, tokens, now);
     }
 
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
@@ -1477,13 +1498,20 @@ private:
         ++cumulative_stats_.decode_rounds;
         cumulative_stats_.decode_row_rounds += lanes.size();
         std::uint32_t committed_this_round = 0;
+        const Clock::time_point round_end = Clock::now();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) {
-                committed_this_round += accepted[row];
-                cumulative_stats_.committed_decode_tokens += accepted[row];
+            if (cancelled[row]) { continue; }
+            committed_this_round += accepted[row];
+            cumulative_stats_.committed_decode_tokens += accepted[row];
+            // A terminal row's slot was removed above; only the lanes still live keep a
+            // per-request rate window.
+            if (slots_[lanes[row]] != nullptr) {
+                Request& live = *slots_[lanes[row]];
+                account_decode_rate(live.decode_rate_window, live.decode_tokens_per_second,
+                                    accepted[row], round_end);
             }
         }
-        account_decode_rate(committed_this_round, Clock::now());
+        account_decode_rate(committed_this_round, round_end);
         publish_runtime_stats();
     }
 
@@ -1627,9 +1655,7 @@ private:
     // bookkeeping, not a decode_batch-only spike. Worker-owned; published only while a lane is
     // decode-ready (and reset to a cold window there), so an idle engine reads 0.
     double decode_tokens_per_second_ = 0.0;
-    std::uint64_t decode_rate_window_tokens_ = 0;
-    Clock::time_point decode_rate_window_start_{};
-    bool decode_rate_window_active_ = false;
+    DecodeRateWindow decode_rate_window_{};
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

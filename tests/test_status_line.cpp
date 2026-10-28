@@ -82,13 +82,15 @@ int main() {
     request.media_phase  = MediaPhase::Preprocess;
     busy.prefill                = request;
     busy.stats.prefill_tokens_per_second = 1140.0;
-    // A decoding request, paired with its live snapshot by engine id.
+    // A decoding request, paired with its live snapshot by engine id. The bar must show its own
+    // lane's decode rate, not the engine-wide one the d/p pair reports.
     busy.stats.decode_requests[0] = ninfer::DecodeRequestStats{
-        .engine_id = 9, .generated_tokens = 51, .budget_tokens = 256};
+        .engine_id = 9, .generated_tokens = 51, .budget_tokens = 256, .tokens_per_second = 512.0};
     // A second decoding lane whose engine started before the serve-side id was bound: no live
-    // snapshot, so it must render the unknown-request sentinel rather than a spurious id.
+    // snapshot, so it must render the unknown-request sentinel rather than a spurious id, at its
+    // own (slower) rate.
     busy.stats.decode_requests[1] = ninfer::DecodeRequestStats{
-        .engine_id = 11, .generated_tokens = 20, .budget_tokens = 100};
+        .engine_id = 11, .generated_tokens = 20, .budget_tokens = 100, .tokens_per_second = 64.0};
     busy.stats.decode_request_count   = 2;
     busy.stats.decode_tokens_per_second = 18.4;
     LiveRequestSnapshot decode_snapshot;
@@ -117,6 +119,11 @@ int main() {
     check(contains(line, "decode req=44"), "the status line must name a decoding request");
     check(contains(line, "51/256"), "the status line must show generated/budget for a decode request");
     check(contains(line, "tools+think"), "the status line must tag a decoding request's kind");
+    check(contains(line, "512 t/s"), "a decode bar must show its own lane's decode rate");
+    check(contains(line, "64 t/s"),
+          "each decoding lane must show its own rate, not the engine-wide one");
+    check(!contains(line, "18 t/s"),
+          "a decode bar must not fall back to the engine-wide decode rate");
     check(contains(line, "decode req=?"),
           "an unregistered decoding request must render the ? sentinel, not a spurious id");
     check(contains(line, "20/100"), "the status line must show generated/budget for the second decode");

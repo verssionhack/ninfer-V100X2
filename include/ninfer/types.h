@@ -685,6 +685,10 @@ struct DecodeRequestStats {
     std::uint64_t engine_id        = 0;
     std::uint32_t generated_tokens = 0; // tokens committed so far in this generation
     std::uint32_t budget_tokens    = 0; // the request's output budget (max_tokens); >= generated
+    // This request's own instant decode rate: the same short-window accounting as
+    // RuntimeStats::decode_tokens_per_second, kept per lane, so concurrent decodes each report
+    // their own speed. Zero until the request's first measurement window elapses.
+    double tokens_per_second = 0.0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
@@ -696,8 +700,8 @@ struct RuntimeStats {
     std::uint64_t committed_decode_tokens = 0;
     // Instant decode throughput: the tokens the most recent decode round committed divided by that
     // round's own wall time, stored unsmoothed so it tracks the real rate (the batched, not
-    // per-request, speed). Unlike `committed_decode_tokens` this is instantaneous; zero while no
-    // lane is decoding.
+    // per-request, speed; the per-lane values are the decode_requests[i] entries). Unlike
+    // `committed_decode_tokens` this is instantaneous; zero while no lane is decoding.
     double decode_tokens_per_second = 0.0;
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;

@@ -228,8 +228,9 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
         wrote_work = true;
     }
     // One progress bar per decoding request, mirroring the prefill readout: a done/budget bar that
-    // fills toward max_tokens, the generated/budget count on the right, the instant decode rate,
-    // and a tag for what the request is generating.
+    // fills toward max_tokens, the generated/budget count on the right, the request's own
+    // instant decode rate (its lane's copy of the short-window measurement, so concurrent
+    // decodes each show a different speed), and a tag for what the request is generating.
     for (std::uint32_t i = 0; i < stats.decode_request_count; ++i) {
         const ninfer::DecodeRequestStats& dreq = stats.decode_requests[i];
         const LiveRequestSnapshot* dreq_snap =
@@ -249,8 +250,8 @@ std::string format_status_line(const StatusSnapshot& snapshot, bool log_mode) {
             total != 0 ? 100.0 * static_cast<double>(std::min(done, total)) / total : 0.0;
         out << " [" << progress_bar(percent) << "] " << std::fixed << std::setprecision(1)
             << percent << "% " << done << '/' << total;
-        if (stats.decode_tokens_per_second > 0.5) {
-            out << ' ' << format_rate(stats.decode_tokens_per_second) << " t/s";
+        if (dreq.tokens_per_second > 0.5) {
+            out << ' ' << format_rate(dreq.tokens_per_second) << " t/s";
         }
         out << ' ' << decode_kind_tag(dreq_snap);
         wrote_work = true;

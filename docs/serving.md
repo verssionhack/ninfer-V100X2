@@ -961,14 +961,17 @@ vision items are encoded by swapping the persistent KV arena to host (the vision
 vision count carries a `swap` suffix. One
 decode bar is drawn per decoding request (up to the concurrency limit): a done/budget progress bar
 against the request's output budget (max_tokens), with the generated count on the right, the
-instant decode rate, and a tag for what it is generating (`tools`, `think`, combined as
-`tools+think`, or `text`). `d/p` shows the current decode and prefill token rates. The prefill
+request's own instant decode rate, and a tag for what it is generating (`tools`, `think`, combined
+as `tools+think`, or `text`). `d/p` shows the current decode and prefill token rates. The prefill
 rate is the tokens the most recent prefill step processed divided by that step's wall time; the
 decode rate is committed tokens over a short (~250 ms) wall-clock window on the worker, so it
 reflects the sustained decode speed including the per-round overhead rather than a decode-only
-spike. Both are published in `RuntimeStats` and track the real speed; they are not differenced
-from the progress counters, which only move in chunk-sized jumps and so would report the chunk
-size rather than throughput. The prefill ETA divides the remaining tokens by the prefill rate.
+spike. The window is kept per request, so each decode bar carries its own speed and concurrent
+lanes can differ bar to bar; the `d/p` decode figure is the engine-wide rate over all decoding
+lanes together. Both are published in `RuntimeStats` and track the real speed; they are not
+differenced from the progress counters, which only move in chunk-sized jumps and so would report
+the chunk size rather than throughput. The prefill ETA divides the remaining tokens by the
+prefill rate.
 The line is redrawn in place only when
 stderr is a terminal, leaving previous logs above it; under `ninfer_tui.py` or a pipe it is
 emitted through the ordinary logger as a terminated `status ...` line at
