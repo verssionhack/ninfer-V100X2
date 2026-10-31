@@ -269,6 +269,48 @@ int main() {
                                       lineage.token_ids, retained.identity),
           "a retained entry without provenance must match on kind and frontier");
 
+    // Value eviction: the scorer, not recency, decides the victim. The lower-scoring entry is
+    // evicted even though it was used more recently than the survivor.
+    ParkedSequenceStore valued(100);
+    valued.set_value_scorer(
+        [](const ParkedSequence& entry) { return static_cast<double>(entry.execution_frontier); });
+    const auto short_entry = valued.insert(entry_of(prompt_of({90, 91}), 40), 1);
+    const auto long_entry  = valued.insert(entry_of(prompt_of({92, 93, 94, 95}), 40), 2);
+    check(short_entry.has_value() && long_entry.has_value(), "both scored entries must fit");
+    valued.touch(*short_entry, 3); // Make the low-value entry the most recently used.
+    const auto newest_entry = valued.insert(entry_of(prompt_of({96, 97, 98, 99, 100, 101}), 40), 4);
+    check(newest_entry.has_value(), "a scored insert must be admitted by eviction");
+    check(valued.find_by_id(*short_entry) == nullptr,
+          "value eviction must drop the lowest-scoring entry, not the oldest");
+    check(valued.find_by_id(*long_entry) != nullptr, "the higher-scoring entry must survive");
+    // Spilling a victim (remove_least_recently_used) applies the same order.
+    ParkedSequenceStore spill_order(100);
+    spill_order.set_value_scorer(
+        [](const ParkedSequence& entry) { return static_cast<double>(entry.execution_frontier); });
+    const auto spill_low  = spill_order.insert(entry_of(prompt_of({110, 111}), 30), 1);
+    const auto spill_high = spill_order.insert(entry_of(prompt_of({112, 113, 114}), 30), 2);
+    check(spill_low.has_value() && spill_high.has_value(), "spill-order entries must fit");
+    std::unique_ptr<ParkedSequence> spilled = spill_order.remove_least_recently_used();
+    check(spilled != nullptr && spilled->execution_frontier == 2,
+          "spill victim selection must prefer the lower value");
+
+    // A pinned entry is never evicted by either policy, and an insert that cannot fit beside it
+    // is refused before anything is evicted.
+    ParkedSequenceStore pinned_store(100);
+    const auto pinned_id   = pinned_store.insert(entry_of(prompt_of({120, 121}), 80), 1);
+    const auto pinned_fill = pinned_store.insert(entry_of(prompt_of({122, 123}), 10), 2);
+    check(pinned_id.has_value() && pinned_fill.has_value(), "pinned fixtures must fit");
+    pinned_store.find_by_id(*pinned_id)->pinned = true;
+    check(!pinned_store.insert(entry_of(prompt_of({124, 125}), 30), 3).has_value(),
+          "an insert that cannot fit beside a pinned entry must be refused");
+    check(pinned_store.find_by_id(*pinned_id) != nullptr &&
+              pinned_store.find_by_id(*pinned_fill) != nullptr,
+          "a refused insert must leave pinned and other entries intact");
+    pinned_store.set_value_scorer([](const ParkedSequence&) { return -1.0; });
+    const auto pinned_third = pinned_store.insert(entry_of(prompt_of({126, 127}), 20), 4);
+    check(pinned_third.has_value() && pinned_store.find_by_id(*pinned_id) != nullptr,
+          "even a scorer that dislikes every entry must not evict a pinned one");
+
     // Erasing releases the bytes it accounted for.
     lru.erase(*first);
     check(lru.used_bytes() == 40 && lru.entry_count() == 1, "erase must release its entry");

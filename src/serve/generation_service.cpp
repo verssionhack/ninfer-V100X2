@@ -239,6 +239,8 @@ private:
 
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
     : options_(std::move(options)) {
+    live_ = std::make_shared<LiveRequestRegistry>(
+        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests + 8);
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
@@ -279,6 +281,13 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_park_io_bytes = options_.kv_park_io_bytes;
     engine_options.kv_park_prefetch = options_.kv_park_prefetch;
     engine_options.kv_park_max_age_sec = options_.kv_park_max_age_sec;
+    engine_options.kv_park_value_policy = !options_.kv_park_lru;
+    engine_options.kv_park_restore_min_saving_ms = options_.kv_park_restore_min_saving_ms;
+    engine_options.kv_park_value_half_life_sec = options_.kv_park_value_half_life_sec;
+    engine_options.kv_park_prefill_tok_s = options_.kv_park_prefill_tok_s;
+    engine_options.kv_park_read_bytes_per_sec = options_.kv_park_read_bytes_per_sec;
+    engine_options.kv_park_restore_overhead_ms = options_.kv_park_restore_overhead_ms;
+    engine_options.kv_park_value_sweep_sec = options_.kv_park_value_sweep_sec;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
@@ -312,7 +321,8 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
-                                           std::function<bool()> is_cancelled) const {
+                                           std::function<bool()> is_cancelled,
+                                           std::uint64_t live_id) const {
     PreparedRequest prepared;
     ninfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
@@ -332,28 +342,54 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
     try {
         const auto acquisition_started = Clock::now();
+        const std::size_t media_total  = request.media_item_count();
+        std::size_t media_done         = 0;
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                     remaining_media_bytes);
+                ninfer::OwnedMedia media = acquire_media(part, prepared.lifetime->deadline,
+                                                         is_cancelled, remaining_media_bytes);
+                ++media_done;
+                if (live_id != 0) {
+                    live_->media_tick(live_id, MediaPhase::Acquire, media_done, media_total);
+                }
+                return media;
             });
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
+        std::function<void(PreparationStage, std::size_t, std::size_t)> progress;
+        if (live_id != 0 && media_total != 0) {
+            progress = [this, live_id](PreparationStage stage, std::size_t done,
+                                       std::size_t total) {
+                const MediaPhase phase = stage == PreparationStage::Acquire
+                                             ? MediaPhase::Acquire
+                                             : MediaPhase::Preprocess;
+                live_->media_tick(live_id, phase, done, total);
+            };
+        }
         const PreparationControl control{
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
+            .progress     = std::move(progress),
         };
         ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
-        prepared.preparation   = prompt.preparation_stats();
+        const PromptSummary summary = prompt.summary();
+        prepared.prompt_tokens      = static_cast<int>(summary.prompt_tokens);
+        prepared.fingerprint        = summary.prompt_fingerprint;
+        prepared.preparation        = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               prepared.lifetime->deadline);
+        prepared.engine_id = prepared.generation.request_id();
+        if (live_id != 0) {
+            live_->bind_engine(live_id, prepared.engine_id,
+                               static_cast<std::uint32_t>(prepared.prompt_tokens),
+                               prepared.fingerprint);
+        }
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);

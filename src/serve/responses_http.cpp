@@ -35,6 +35,7 @@ struct StreamingResponse {
     ResponseContext previous_context;
     RequestLogContext log_context;
     std::unique_ptr<ResponsesEventStream> encoder;
+    LiveRequestLease lease;
     std::atomic<bool> cancelled{false};
     bool started = false;
 };
@@ -230,9 +231,15 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    LiveRequestLease live_lease(service_->live_status(), req_id,
+                                request.generation.media_item_count(), "openai_responses",
+                                request.stream, request.generation.uses_tools(),
+                                request.generation.enable_thinking.value_or(
+                                    options_.enable_thinking));
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
+        prepared =
+            service_->prepare(request.generation, [&req] { return disconnected(req); }, req_id);
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
@@ -283,6 +290,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     auto stream              = std::make_shared<StreamingResponse>();
     stream->prepared         = std::move(prepared);
+    stream->lease            = std::move(live_lease);
     stream->request          = std::move(request);
     stream->previous_context = std::move(previous_context);
     stream->log_context      = log_context;

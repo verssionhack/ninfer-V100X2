@@ -69,7 +69,17 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
-    if (workspace != nullptr && nvfp4_volta_qpn_precast_supported(weight.n, weight.k, total_t)) {
+    const bool qpn_layout = weight.layout == QuantLayout::VoltaQpnPrepacked;
+    // Opt-in prefill route: decode NVFP4 into shared memory once per K pass and feed mma.sync
+    // directly, instead of materializing the whole weight as an FP16 scratch for CUTLASS. It
+    // consumes the portable code plane, which the opt-in load path keeps (prepack skipped).
+    if (!qpn_layout && nvfp4_volta_mma_prefill_enabled() && workspace != nullptr &&
+        total_t >= 128 && nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
+        launch_nvfp4_volta_mma(x, weight, out, *workspace, stream);
+        return;
+    }
+    if (qpn_layout && workspace != nullptr &&
+        nvfp4_volta_qpn_precast_supported(weight.n, weight.k, total_t)) {
         launch_nvfp4_volta_qpn_precast(x, weight, out, *workspace, stream);
         return;
     }
@@ -79,7 +89,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
         nvfp4_cutlass_sm70_launch(x, weight, out, *workspace, stream);
         return;
     }
-    const bool qpn            = nvfp4_volta_qpn_supported(weight.n, weight.k, kNvfp4VoltaQpnMaxTokens);
+    const bool qpn            = qpn_layout && nvfp4_volta_qpn_supported(weight.n, weight.k, kNvfp4VoltaQpnMaxTokens);
     const std::int32_t kChunk = qpn ? kNvfp4VoltaQpnMaxTokens : kNvfp4LastSmallT;
 #else
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
@@ -93,7 +103,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
 #ifdef NINFER_VOLTA_BUILD
-        if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+        if (qpn_layout && nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
             launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
             continue;
         }
@@ -119,10 +129,17 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
 #ifdef NINFER_VOLTA_BUILD
+    std::size_t bytes = 0;
     if (max_tokens >= 128) {
-        return nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
+        bytes = nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
+    } else {
+        bytes = nvfp4_volta_qpn_precast_workspace_bytes(output_rows, input_rows, max_tokens);
     }
-    return nvfp4_volta_qpn_precast_workspace_bytes(output_rows, input_rows, max_tokens);
+    if (nvfp4_volta_mma_prefill_enabled() && max_tokens >= 128 &&
+        nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
+        bytes = std::max(bytes, nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens));
+    }
+    return bytes;
 #endif
     return 0;
 }

@@ -1,11 +1,16 @@
 #include "serve/console_log.h"
 
+#include <unistd.h>
+
 #include <chrono>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <string>
 
 namespace ninfer::serve {
 namespace {
@@ -25,6 +30,44 @@ const char* level_name(ConsoleLogLevel level) noexcept {
 std::mutex& console_mutex() {
     static std::mutex mutex;
     return mutex;
+}
+
+std::ofstream& console_log_file() {
+    static std::ofstream file;
+    return file;
+}
+
+std::string& status_text() {
+    static std::string text;
+    return text;
+}
+
+bool& status_open() {
+    static bool open = false;
+    return open;
+}
+
+std::size_t& status_width() {
+    static std::size_t width = 0;
+    return width;
+}
+
+// Callers hold console_mutex().
+void erase_status_locked() {
+    if (!status_open()) { return; }
+    std::cerr << '\r' << std::string(status_width(), ' ') << '\r';
+    status_open() = false;
+}
+
+// Callers hold console_mutex().
+void draw_status_locked() {
+    if (status_text().empty()) {
+        status_width() = 0;
+        return;
+    }
+    std::cerr << '\r' << status_text();
+    status_width() = status_text().size();
+    status_open()  = true;
 }
 
 } // namespace
@@ -52,7 +95,49 @@ std::string current_console_log_prefix(ConsoleLogLevel level) {
 
 void write_console_log(ConsoleLogLevel level, std::string_view message) {
     std::lock_guard lock(console_mutex());
-    std::cerr << current_console_log_prefix(level) << message << '\n';
+    erase_status_locked();
+    const std::string line = current_console_log_prefix(level) + std::string(message);
+    std::cerr << line << '\n';
+    draw_status_locked();
+    std::cerr.flush();
+    std::ofstream& file = console_log_file();
+    if (file.is_open()) {
+        file << line << '\n';
+        file.flush();
+    }
+}
+
+bool open_console_log_file(std::string_view path, std::string& error) {
+    std::error_code code;
+    const std::filesystem::path target(path);
+    if (target.has_parent_path() && !std::filesystem::is_directory(target.parent_path(), code)) {
+        error = "parent directory does not exist: " + target.parent_path().string();
+        return false;
+    }
+    std::lock_guard lock(console_mutex());
+    console_log_file().open(target, std::ios::out | std::ios::app);
+    if (!console_log_file().is_open()) {
+        error = "cannot open " + target.string() + " for append";
+        return false;
+    }
+    return true;
+}
+
+void set_console_status_line(std::string_view line) {
+    if (::isatty(STDERR_FILENO) != 1) { return; }
+    std::lock_guard lock(console_mutex());
+    status_text().assign(line);
+    erase_status_locked();
+    draw_status_locked();
+    std::cerr.flush();
+}
+
+void clear_console_status_line() {
+    std::lock_guard lock(console_mutex());
+    erase_status_locked();
+    status_text().clear();
+    status_width() = 0;
+    std::cerr.flush();
 }
 
 } // namespace ninfer::serve

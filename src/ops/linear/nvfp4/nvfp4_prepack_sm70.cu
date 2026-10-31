@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include <cstdint>
 
@@ -51,6 +52,10 @@ __global__ void prepack_qpn_kernel(const std::uint8_t* __restrict__ input_codes,
 } // namespace
 
 void nvfp4_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
+    // The wide-T fused-dequant prefill MMA reads the portable row-major code plane, so the
+    // opt-in route must keep the artifact layout; its small-T/decode paths use the generic
+    // (non-QPN) NVFP4 kernels instead.
+    if (nvfp4_volta_mma_prefill_enabled()) { return; }
     const Nvfp4WeightGeometry geometry = validate_nvfp4_weight(weight, "NVFP4 QPN prepack");
     DeviceBuffer scratch(static_cast<std::size_t>(geometry.code_plane_bytes +
                                                   geometry.scale_plane_bytes));

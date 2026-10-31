@@ -10,6 +10,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -27,6 +29,8 @@ struct StreamingRequest {
     explicit StreamingRequest(PreparedRequest request) : prepared(std::move(request)) {}
 
     PreparedRequest prepared;
+    // Keeps the live-status registration alive for the lifetime of the streamed response.
+    LiveRequestLease lease;
     std::atomic<bool> cancelled{false};
     bool started = false;
 };
@@ -380,10 +384,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    LiveRequestLease live_lease(service_->live_status(), req_id, request.media_item_count(),
+                                "openai_chat_completions", request.stream, request.uses_tools(),
+                                request.enable_thinking.value_or(options_.enable_thinking));
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); },
+            req_id);
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
                                                                 request, e.error()));
@@ -433,6 +441,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
+    stream->lease            = std::move(live_lease);
     const bool include_usage = stream->prepared.include_usage;
     const bool tool_capable  = stream->prepared.tool_capable;
 
@@ -636,10 +645,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    LiveRequestLease live_lease(service_->live_status(), req_id, request.media_item_count(),
+                                "anthropic_messages", request.stream, request.uses_tools(),
+                                request.enable_thinking.value_or(options_.enable_thinking));
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); },
+            req_id);
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
@@ -692,6 +705,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     auto stream             = std::make_shared<StreamingRequest>(std::move(prepared));
+    stream->lease            = std::move(live_lease);
     const bool tool_capable = stream->prepared.tool_capable;
 
     res.set_header("Cache-Control", "no-cache");
@@ -852,12 +866,24 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    if (options_.status_line) {
+        StatusLineOptions status_options;
+        status_options.enabled   = true;
+        status_options.interval  = std::chrono::milliseconds(options_.status_line_interval_ms);
+        status_options.log_interval = std::chrono::milliseconds(
+            options_.log_stats_interval_ms != 0 ? options_.log_stats_interval_ms : 5000);
+        status_options.interactive = ::isatty(STDERR_FILENO) == 1;
+        status_line_ = std::make_unique<StatusLineReporter>(*service_, status_options);
+        status_line_->start();
+    }
     try {
         const bool result = server_.listen_after_bind();
         stop_stats_reporter();
+        status_line_.reset();
         return result;
     } catch (...) {
         stop_stats_reporter();
+        status_line_.reset();
         throw;
     }
 }

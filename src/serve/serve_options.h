@@ -26,6 +26,7 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    std::string console_log_file;                 // empty => console log goes to stderr only
     std::uint32_t max_context              = 8192;
     // Rotary regime, mirroring the CLI. `--rope yarn` raises the ceiling `--max-context` is
     // checked against to `--yarn-origin x --yarn-factor`; Engine performs that check.
@@ -71,6 +72,20 @@ struct ServeOptions {
     std::uint64_t kv_park_io_bytes     = 8ULL << 30;
     std::uint32_t kv_park_prefetch     = 0;
     std::uint64_t kv_park_max_age_sec  = 0;
+    // Value-based retention for spilled conversations. The scorer compares the estimated
+    // re-prefill time a restore saves against the image's disk read time and byte occupancy;
+    // --kv-park-lru restores the previous least-recently-used policy.
+    bool kv_park_lru                            = false;
+    std::uint32_t kv_park_restore_min_saving_ms = 750;
+    std::uint64_t kv_park_value_half_life_sec   = 1800;
+    std::uint32_t kv_park_prefill_tok_s         = 0; // 0 = measure; fallback 1000
+    std::uint64_t kv_park_read_bytes_per_sec    = 0; // 0 = measure; fallback 1.5e9
+    std::uint32_t kv_park_restore_overhead_ms   = 250;
+    std::uint32_t kv_park_value_sweep_sec       = 60; // 0 = only when spilling
+    // Live status line on stderr. Off by default; redraws only when stderr is a terminal,
+    // otherwise emits one line per --log-stats-interval-ms through the normal logger.
+    bool status_line                      = false;
+    std::uint32_t status_line_interval_ms = 500;
     bool volta_long_attention = false;
     bool volta_fast_decode = false;
     SpeculativeOptions speculative;

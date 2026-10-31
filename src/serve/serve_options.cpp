@@ -133,7 +133,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--console-log-file FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] [--kv-park-bytes N] "
@@ -144,6 +144,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--shared-prefix-dir DIR]] "
            "[--kv-park-spill-dir DIR] [--kv-park-spill-bytes N] "
            "[--kv-park-io-bytes N] [--kv-park-prefetch N] [--kv-park-max-age-sec N] "
+           "[--kv-park-lru] [--kv-park-restore-min-saving-ms N] "
+           "[--kv-park-value-half-life-sec N] [--kv-park-prefill-tok-s N] "
+           "[--kv-park-read-bytes-per-sec N] [--kv-park-restore-overhead-ms N] "
+           "[--kv-park-value-sweep-sec N] "
+           "[--status-line [--status-line-interval-ms N]] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -165,6 +170,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --console-log-file appends plain log lines (never the live status redraws), so a\n"
+           "       terminal keeps the in-place status line while the file stays line-oriented\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -195,6 +202,16 @@ std::string serve_usage_text(const char* argv0) {
            "       at startup, in fixed MRU order (default 0)\n"
            "       --kv-park-max-age-sec N deletes spill images idle longer than N seconds; the byte\n"
            "       budget still evicts least-recently-used entries (default 0 = no age limit)\n"
+           "       spilled conversations are retained by estimated value by default: expected\n"
+           "       re-prefill seconds saved (frontier tokens / measured prefill rate) minus disk\n"
+           "       read time and overhead, decayed by idle time, per byte. --kv-park-lru restores\n"
+           "       pure LRU; --kv-park-restore-min-saving-ms (default 750, 0 disables) skips a disk\n"
+           "       restore whose estimated net saving is below the threshold, so a shallow match\n"
+           "       after a client compacts its transcript does not pay for a multi-gigabyte read\n"
+           "       --status-line redraws one progress/status line on a terminal (request id,\n"
+           "       prompt fingerprint, prefill bar and ETA, media/vision counts, queue/decode,\n"
+           "       KV park gauges); with non-terminal stderr it emits one line per\n"
+           "       --log-stats-interval-ms instead of using carriage returns\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -351,6 +368,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--console-log-file") {
+            options.console_log_file = require_value("--console-log-file");
+            if (options.console_log_file.empty()) {
+                throw std::invalid_argument("--console-log-file must not be empty");
+            }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -456,6 +478,36 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-park-max-age-sec") {
             options.kv_park_max_age_sec =
                 parse_u64(require_value("--kv-park-max-age-sec"), "kv-park-max-age-sec");
+        } else if (arg == "--kv-park-lru") {
+            options.kv_park_lru = true;
+        } else if (arg == "--kv-park-restore-min-saving-ms") {
+            options.kv_park_restore_min_saving_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-park-restore-min-saving-ms"),
+                                      "kv-park-restore-min-saving-ms"));
+        } else if (arg == "--kv-park-value-half-life-sec") {
+            options.kv_park_value_half_life_sec = parse_u64(
+                require_value("--kv-park-value-half-life-sec"), "kv-park-value-half-life-sec");
+        } else if (arg == "--kv-park-prefill-tok-s") {
+            options.kv_park_prefill_tok_s = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-park-prefill-tok-s"),
+                                      "kv-park-prefill-tok-s"));
+        } else if (arg == "--kv-park-read-bytes-per-sec") {
+            options.kv_park_read_bytes_per_sec = parse_u64(
+                require_value("--kv-park-read-bytes-per-sec"), "kv-park-read-bytes-per-sec");
+        } else if (arg == "--kv-park-restore-overhead-ms") {
+            options.kv_park_restore_overhead_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-park-restore-overhead-ms"),
+                                      "kv-park-restore-overhead-ms"));
+        } else if (arg == "--kv-park-value-sweep-sec") {
+            options.kv_park_value_sweep_sec = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-park-value-sweep-sec"),
+                                      "kv-park-value-sweep-sec"));
+        } else if (arg == "--status-line") {
+            options.status_line = true;
+        } else if (arg == "--status-line-interval-ms") {
+            options.status_line_interval_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--status-line-interval-ms"),
+                                      "status-line-interval-ms"));
         } else if (arg == "--vision-max-tokens") {
             options.vision_max_tokens = parse_vision_token_budget(require_value("--vision-max-tokens"));
         } else if (arg == "--no-cuda-graph") {
@@ -521,6 +573,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.kv_park_prefetch > 64) {
         throw std::invalid_argument("--kv-park-prefetch must be in [0,64]");
+    }
+    if (options.kv_park_value_half_life_sec == 0) {
+        throw std::invalid_argument("--kv-park-value-half-life-sec must be positive");
+    }
+    if (options.status_line_interval_ms < 100 || options.status_line_interval_ms > 60000) {
+        throw std::invalid_argument("--status-line-interval-ms must be in [100,60000]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.ram_kv.gpu_tokens == 0 && options.kv_capacity.mode == KvCapacityMode::Explicit &&

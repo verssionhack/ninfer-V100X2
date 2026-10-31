@@ -60,6 +60,15 @@ int main() {
                       "background spill writer budget default mismatch");
     failures += check(defaults.kv_park_prefetch == 0 && defaults.kv_park_max_age_sec == 0,
                       "spill prefetch/age defaults mismatch");
+    failures += check(!defaults.kv_park_lru && defaults.kv_park_restore_min_saving_ms == 750 &&
+                          defaults.kv_park_value_half_life_sec == 1800 &&
+                          defaults.kv_park_prefill_tok_s == 0 &&
+                          defaults.kv_park_read_bytes_per_sec == 0 &&
+                          defaults.kv_park_restore_overhead_ms == 250 &&
+                          defaults.kv_park_value_sweep_sec == 60,
+                      "value-retention policy defaults mismatch");
+    failures += check(!defaults.status_line && defaults.status_line_interval_ms == 500,
+                      "status line must be off by default");
     failures += check(defaults.default_max_tokens == 65536,
                       "default output-token budget mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
@@ -273,6 +282,45 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--kv-park-prefetch", "65"});
     } catch (const std::invalid_argument&) { bad_prefetch_rejected = true; }
     failures += check(bad_prefetch_rejected, "an out-of-range --kv-park-prefetch was accepted");
+    const ServeOptions value_policy =
+        parse({"ninfer-serve", "model.ninfer", "--kv-park-lru",
+               "--kv-park-restore-min-saving-ms", "0", "--kv-park-value-half-life-sec", "600",
+               "--kv-park-prefill-tok-s", "800", "--kv-park-read-bytes-per-sec", "2000000000",
+               "--kv-park-restore-overhead-ms", "100", "--kv-park-value-sweep-sec", "5"});
+    failures += check(value_policy.kv_park_lru &&
+                          value_policy.kv_park_restore_min_saving_ms == 0 &&
+                          value_policy.kv_park_value_half_life_sec == 600 &&
+                          value_policy.kv_park_prefill_tok_s == 800 &&
+                          value_policy.kv_park_read_bytes_per_sec == 2000000000ULL &&
+                          value_policy.kv_park_restore_overhead_ms == 100 &&
+                          value_policy.kv_park_value_sweep_sec == 5,
+                      "value-retention flags did not reach serving options");
+    bool bad_half_life_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-park-value-half-life-sec", "0"});
+    } catch (const std::invalid_argument&) { bad_half_life_rejected = true; }
+    failures += check(bad_half_life_rejected, "a zero --kv-park-value-half-life-sec was accepted");
+    const ServeOptions status_line =
+        parse({"ninfer-serve", "model.ninfer", "--status-line",
+               "--status-line-interval-ms", "250"});
+    failures += check(status_line.status_line && status_line.status_line_interval_ms == 250,
+                      "status-line flags did not reach serving options");
+    for (const char* invalid : {"99", "60001"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--status-line-interval-ms", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an out-of-range --status-line-interval-ms was accepted");
+    }
+    const ServeOptions console_log =
+        parse({"ninfer-serve", "model.ninfer", "--console-log-file", "profiles/serve.log"});
+    failures += check(console_log.console_log_file == "profiles/serve.log",
+                      "console log file did not reach serving options");
+    const std::string usage = serve_usage_text("ninfer-serve");
+    failures += check(usage.find("--status-line") != std::string::npos &&
+                          usage.find("--console-log-file") != std::string::npos &&
+                          usage.find("--kv-park-restore-min-saving-ms") != std::string::npos,
+                      "the usage text does not document the new options");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,

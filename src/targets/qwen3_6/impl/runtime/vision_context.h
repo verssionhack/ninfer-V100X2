@@ -109,6 +109,13 @@ public:
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
+    // Live prefill progress: one encoded item per `uses` entry, counted after its encode is
+    // recorded. Worker-only (the prefill owner is the sole reader).
+    [[nodiscard]] std::size_t items_total() const noexcept { return plan_.uses.size(); }
+    [[nodiscard]] std::size_t items_encoded() const noexcept { return items_encoded_; }
+    // True when this session encodes items by swapping the persistent KV arena to host
+    // (vision_kv_swap) rather than from resident scratch. Worker-only.
+    [[nodiscard]] bool uses_swap() const noexcept { return swap_.evict != nullptr; }
 
 private:
     DeviceContext& device_;
@@ -121,6 +128,7 @@ private:
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
+    std::size_t items_encoded_ = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

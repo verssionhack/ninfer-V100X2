@@ -7,8 +7,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
+
+// Opt-in prefill route (NINFER_NVFP4_VOLTA_MMA=1): the wide-T fused-dequant MMA below, which
+// consumes the portable row-major code plane. Selecting it also keeps that layout at load time
+// (the load-time QPN prepack is skipped), so small-T/decode fall back to the generic NVFP4 paths.
+[[nodiscard]] inline bool nvfp4_volta_mma_prefill_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_NVFP4_VOLTA_MMA");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
 
 void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);

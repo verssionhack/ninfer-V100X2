@@ -264,6 +264,22 @@ const SpeculativeStats& Program<Variant>::speculative_stats_lane(std::uint32_t l
 }
 
 template <>
+std::pair<std::uint32_t, std::uint32_t>
+Program<Variant>::prefill_vision_progress(std::uint32_t lane) const noexcept {
+    return impl_->prefill_vision_progress(lane);
+}
+
+template <>
+bool Program<Variant>::prefill_vision_swap(std::uint32_t lane) const noexcept {
+    return impl_->prefill_vision_swap(lane);
+}
+
+template <>
+KvParkStats Program<Variant>::kv_park_stats() const noexcept {
+    return impl_->kv_park_stats();
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

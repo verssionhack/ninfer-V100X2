@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -102,6 +103,12 @@ public:
 
         Submission(const Submission&)            = delete;
         Submission& operator=(const Submission&) = delete;
+
+        // Engine-local id assigned at submission. Survives until wait() consumes the request;
+        // 0 for a default-constructed handle or the zero-output immediate path.
+        [[nodiscard]] std::uint64_t request_id() const noexcept {
+            return request_ ? request_->id : 0;
+        }
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
             if (owner_ == nullptr || request_ == nullptr) {
@@ -260,15 +267,52 @@ private:
         if (prefill_lane_) {
             if (const std::shared_ptr<Request>& active = slots_[*prefill_lane_];
                 active != nullptr) {
-                snapshot.prefill_prompt_tokens    = active->prompt_summary.prompt_tokens;
-                snapshot.prefill_processed_tokens = active->prefill_processed_tokens;
+                snapshot.prefill_prompt_tokens     = active->prompt_summary.prompt_tokens;
+                snapshot.prefill_processed_tokens  = active->prefill_processed_tokens;
+                snapshot.prefill_start_tokens      = active->prefill_start_tokens;
+                snapshot.prefill_request_id        = active->id;
+                snapshot.prefill_tokens_per_second = active->prefill_tokens_per_second;
+                snapshot.prefill_vision_done =
+                    active->prefill_vision_done.load(std::memory_order_relaxed);
+                snapshot.prefill_vision_total =
+                    active->prefill_vision_total.load(std::memory_order_relaxed);
+                snapshot.prefill_vision_swap =
+                    active->prefill_vision_swap.load(std::memory_order_relaxed) ? 1U : 0U;
+                snapshot.prefill_reuse_path = active->begin
+                    ? static_cast<std::uint8_t>(active->begin->prefix_reuse_path) : 0U;
             }
         }
+        snapshot.kv_park = instance_.program->kv_park_stats();
+        std::uint32_t decode_count = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
-            if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
+            const Request& request = *slots_[lane];
+            if (!request.decode_ready) { continue; }
+            ++snapshot.decode_ready_requests;
+            if (decode_count < kMaximumConcurrency) {
+                // generated + remaining is the request's original effective output budget, so the
+                // status bar is generated/budget and can never run past 100%.
+                const std::uint32_t generated = static_cast<std::uint32_t>(request.generated.size());
+                const std::uint32_t remaining = request.budget ? request.budget->remaining() : 0;
+                snapshot.decode_requests[decode_count] = DecodeRequestStats{
+                    .engine_id         = request.id,
+                    .generated_tokens  = generated,
+                    .budget_tokens     = generated + remaining,
+                    .tokens_per_second = request.decode_tokens_per_second,
+                };
+                ++decode_count;
+            }
         }
+        snapshot.decode_request_count = decode_count;
+        // Publish the instant decode rate only while a lane is decoding; when none are, cold the
+        // window too so a later decode resumes measuring from a fresh window, not a stale one.
+        if (snapshot.decode_ready_requests == 0) {
+            decode_rate_window_       = DecodeRateWindow{};
+            decode_tokens_per_second_ = 0.0;
+        }
+        snapshot.decode_tokens_per_second =
+            snapshot.decode_ready_requests > 0 ? decode_tokens_per_second_ : 0.0;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -344,6 +388,15 @@ private:
         }
     }
 
+    // Committed-token window behind a decode rate (the engine-wide one and each request's own):
+    // tokens accumulate until the window elapses, then the rate is published and it restarts.
+    // Worker-owned.
+    struct DecodeRateWindow {
+        std::uint64_t tokens = 0;
+        Clock::time_point start{};
+        bool active = false;
+    };
+
     struct Request {
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
@@ -357,6 +410,13 @@ private:
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
+        // Vision encode progress of this request's prefill, written by the worker after each
+        // prefill step and read by the stats publisher.
+        std::atomic<std::uint32_t> prefill_vision_done{0};
+        std::atomic<std::uint32_t> prefill_vision_total{0};
+        // Whether this request's prefill encodes vision via the KV-swap path; written by the
+        // worker, read by the stats publisher.
+        std::atomic<bool> prefill_vision_swap{false};
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
         Clock::time_point deadline;
@@ -384,6 +444,20 @@ private:
         // Prompt tokens of this request made resident so far (reused prefix + prefill work), a
         // live progress readout for the runtime-stats snapshot while it owns the prefill lane.
         std::uint32_t prefill_processed_tokens = 0;
+        // Fixed seed for the run: the token position the prefill work begins (the reused prefix).
+        // `prefill_processed_tokens` starts here; the new-work window is [start, prompt length).
+        std::uint32_t prefill_start_tokens = 0;
+        // Instant prefill throughput: processed tokens divided by the last lane step's own wall
+        // time, stored unsmoothed. Worker-owned; published in the stats snapshot while the
+        // request owns the lane. Reused-prefix tokens are resident before the first step and are
+        // not part of any step, so they do not count.
+        double prefill_tokens_per_second = 0.0;
+        // This request's own instant decode throughput: the same short-window accounting as the
+        // engine-wide decode_tokens_per_second, kept per lane, so concurrent decodes each report
+        // their own speed. Worker-owned; published in the stats snapshot as the
+        // DecodeRequestStats entry for this request.
+        double decode_tokens_per_second = 0.0;
+        DecodeRateWindow decode_rate_window{};
 
         std::optional<BasePlan> base_plan;
         std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
@@ -742,6 +816,53 @@ private:
         return active;
     }
 
+    // Record this request's instant prefill speed: the tokens the step processed divided by the
+    // step's own wall time. It is stored as-is -- an instant reading, not smoothed -- so the
+    // status line tracks the real rate rather than lagging behind it. A reader differencing
+    // `prefill_processed_tokens` instead sees progress land in chunk-sized jumps and can only
+    // recover the chunk size, not the rate. Steps shorter than the floor are skipped: their time
+    // is call overhead, not prefill work.
+    static void account_prefill_rate(Request& request, std::uint32_t tokens,
+                                     Clock::time_point step_started,
+                                     Clock::time_point step_finished) noexcept {
+        const double seconds = std::chrono::duration<double>(step_finished - step_started).count();
+        constexpr double kMinimumStepSeconds = 0.001;
+        if (tokens == 0 || !(seconds >= kMinimumStepSeconds)) { return; }
+        const double rate = static_cast<double>(tokens) / seconds;
+        if (!std::isfinite(rate) || rate <= 0.0) { return; }
+        request.prefill_tokens_per_second = rate;
+    }
+
+    // Record this round's contribution to a decode rate over a short wall-clock window. The
+    // window divides committed tokens by the actual time elapsed on the worker between rounds --
+    // which includes the per-round bookkeeping (detokenization, batch resolution, the gap to the
+    // next round) that a decode_batch-only timing excludes. That is what makes the published
+    // number the real sustained decode speed instead of an unrealistically high instantaneous
+    // spike. Tokens accumulate until the window elapses, then the rate is recomputed and the
+    // window restarts. Shared by the engine-wide rate (all decoding lanes together) and each
+    // request's own rate; worker-owned.
+    static void account_decode_rate(DecodeRateWindow& window, double& published,
+                                    std::uint32_t tokens, Clock::time_point now) noexcept {
+        if (tokens == 0) { return; }
+        window.tokens += tokens;
+        if (!window.active) {
+            window.active = true;
+            window.start  = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - window.start).count();
+        constexpr double kDecodeRateWindowSeconds = 0.25;
+        if (seconds < kDecodeRateWindowSeconds) { return; }
+        const double rate = static_cast<double>(window.tokens) / seconds;
+        if (std::isfinite(rate) && rate > 0.0) { published = rate; }
+        window.tokens = 0;
+        window.start  = now;
+    }
+
+    void account_decode_rate(std::uint32_t tokens, Clock::time_point now) noexcept {
+        account_decode_rate(decode_rate_window_, decode_tokens_per_second_, tokens, now);
+    }
+
     void resolve_prefill_step(const std::shared_ptr<Request>& request,
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
@@ -832,8 +953,16 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        const Clock::time_point step_started = Clock::now();
         const PrefillStepResult step =
             instance_.program->advance_prefill_lane(lane, prefill_step_tokens());
+        const Clock::time_point step_finished = Clock::now();
+        const auto vision                     = instance_.program->prefill_vision_progress(lane);
+        request->prefill_vision_done.store(vision.first, std::memory_order_relaxed);
+        request->prefill_vision_total.store(vision.second, std::memory_order_relaxed);
+        request->prefill_vision_swap.store(
+            instance_.program->prefill_vision_swap(lane), std::memory_order_relaxed);
+        account_prefill_rate(*request, step.processed_prompt_tokens, step_started, step_finished);
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();
@@ -1041,7 +1170,9 @@ private:
             request->admission_resources    = summary.admission;
             request->remaining_service_work = summary.service_work_quanta;
             // A reused prefix is already resident, so progress starts there and the prefill work
-            // below carries it to the full prompt length.
+            // below carries it to the full prompt length. Both the seed (start) and the running
+            // count begin at the reused token count; the new-work window is [start, prompt).
+            request->prefill_start_tokens     = summary.reusable_prompt_tokens;
             request->prefill_processed_tokens = summary.reusable_prompt_tokens;
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
@@ -1069,13 +1200,19 @@ private:
                 transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
-            target_started                = true;
+            target_started                        = true;
+            const Clock::time_point first_started = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 prefill_step_tokens());
+            const Clock::time_point first_finished = Clock::now();
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
+            account_prefill_rate(*request, first.processed_prompt_tokens, first_started,
+                                 first_finished);
+            request->prefill_vision_swap.store(
+                instance_.program->prefill_vision_swap(lane), std::memory_order_relaxed);
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
@@ -1381,9 +1518,21 @@ private:
         }
         ++cumulative_stats_.decode_rounds;
         cumulative_stats_.decode_row_rounds += lanes.size();
+        std::uint32_t committed_this_round = 0;
+        const Clock::time_point round_end = Clock::now();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
+            if (cancelled[row]) { continue; }
+            committed_this_round += accepted[row];
+            cumulative_stats_.committed_decode_tokens += accepted[row];
+            // A terminal row's slot was removed above; only the lanes still live keep a
+            // per-request rate window.
+            if (slots_[lanes[row]] != nullptr) {
+                Request& live = *slots_[lanes[row]];
+                account_decode_rate(live.decode_rate_window, live.decode_tokens_per_second,
+                                    accepted[row], round_end);
+            }
         }
+        account_decode_rate(committed_this_round, round_end);
         publish_runtime_stats();
     }
 
@@ -1522,6 +1671,12 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::uint32_t decode_rounds_since_prefill_ = 0;
+    // Instant decode throughput: committed tokens over a short wall-clock window (see
+    // account_decode_rate), so it reflects the sustained decode speed including per-round
+    // bookkeeping, not a decode_batch-only spike. Worker-owned; published only while a lane is
+    // decode-ready (and reset to a cold window there), so an idle engine reads 0.
+    double decode_tokens_per_second_ = 0.0;
+    DecodeRateWindow decode_rate_window_{};
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

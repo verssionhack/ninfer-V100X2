@@ -140,11 +140,18 @@ int main() {
         meta_geometry.slot_bytes              = 8;
         meta_geometry.text_plane_count        = 2;
         meta_geometry.backend_plane_count     = 2;
+        entry.reuse_hits        = 3;
+        entry.restore_count     = 2;
+        entry.created_wall_sec  = 111;
+        entry.last_hit_wall_sec = 222;
         const std::string meta_path =
             (std::filesystem::temp_directory_path() / "ninfer_sequence_meta.img.meta").string();
         d::write_sequence_metadata(entry, 987654, meta_geometry, meta_path);
         std::unique_ptr<d::ParkedSequence> meta =
             d::read_sequence_metadata(meta_path, meta_geometry);
+        check(meta->reuse_hits == 3 && meta->restore_count == 2 &&
+                  meta->created_wall_sec == 111 && meta->last_hit_wall_sec == 222,
+              "metadata sidecar retention usage");
         check(meta->execution_frontier == 40 && meta->ledger_frontier == 40 &&
                   meta->bytes == 987654 && meta->ledger == entry.ledger,
               "metadata sidecar did not round-trip");
@@ -209,22 +216,43 @@ int main() {
         plain.text_pages    = {3, 3};
         plain.backend_pages = {4, 4};
         plain.bytes         = 123;
+        const std::string meta_v3_path =
+            (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v3.img.meta").string();
+        d::write_sequence_metadata(plain, 123, legacy_geometry, meta_v3_path);
+        // v3 appends the retention usage trailer: two u32 counters and two u64 wall times.
+        // v1 also predates the resume-anchor presence byte, so it drops one byte more.
+        const auto rewrite_meta_version = [&](const std::string& to, std::uint32_t version,
+                                              std::size_t drop) {
+            std::ifstream in(meta_v3_path, std::ios::binary);
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+            bytes.resize(bytes.size() - drop);
+            std::memcpy(bytes.data() + 4, &version, sizeof(version));
+            std::ofstream out(to, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        };
         const std::string meta_v2_path =
             (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v2.img.meta").string();
-        d::write_sequence_metadata(plain, 123, legacy_geometry, meta_v2_path);
+        rewrite_meta_version(meta_v2_path, 2, 24);
         const std::string meta_v1_path =
             (std::filesystem::temp_directory_path() / "ninfer_sequence_anchor_v1.img.meta").string();
-        rewrite_version(meta_v2_path, meta_v1_path, 1);
-        std::unique_ptr<d::ParkedSequence> legacy_meta =
-            d::read_sequence_metadata(meta_v1_path, legacy_geometry);
-        check(legacy_meta->execution_frontier == 40 && legacy_meta->text_pages == plain.text_pages &&
-                  legacy_meta->resume_anchor.frontier == 0,
-              "v1 metadata sidecar without a resume anchor remains readable");
+        rewrite_meta_version(meta_v1_path, 1, 25);
+        for (const std::string& legacy_path : {meta_v1_path, meta_v2_path}) {
+            std::unique_ptr<d::ParkedSequence> legacy_meta =
+                d::read_sequence_metadata(legacy_path, legacy_geometry);
+            check(legacy_meta->execution_frontier == 40 &&
+                      legacy_meta->text_pages == plain.text_pages &&
+                      legacy_meta->resume_anchor.frontier == 0 &&
+                      legacy_meta->reuse_hits == 0 && legacy_meta->restore_count == 0 &&
+                      legacy_meta->created_wall_sec == 0 && legacy_meta->last_hit_wall_sec == 0,
+                  "pre-v3 metadata sidecars remain readable with zero usage");
+        }
 
         std::filesystem::remove(current_path);
         std::filesystem::remove(v3_path);
         std::filesystem::remove(meta_v1_path);
         std::filesystem::remove(meta_v2_path);
+        std::filesystem::remove(meta_v3_path);
     }
 
     // Truncation is rejected rather than partially applied.

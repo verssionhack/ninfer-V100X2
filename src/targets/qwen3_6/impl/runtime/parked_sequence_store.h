@@ -14,8 +14,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -196,6 +199,14 @@ struct ParkedSequence {
 
     std::size_t bytes       = 0;
     std::uint64_t last_used = 0;
+
+    // Retention scoring. `last_used` is a park-clock ordering tick; these wall-clock timestamps and
+    // counters carry a conversation's history across the one-shot disk cycle and are persisted in
+    // the sidecar. A restore increments both counters and sets last_hit_wall_sec.
+    std::uint32_t reuse_hits       = 0;
+    std::uint32_t restore_count    = 0;
+    std::uint64_t created_wall_sec = 0;
+    std::uint64_t last_hit_wall_sec = 0;
 };
 
 // Heap bytes the matcher keeps when an entry is disk-backed. Budgeted with the payload so a pile
@@ -286,9 +297,16 @@ struct ParkedCheckpointMatch {
  */
 class ParkedSequenceStore {
 public:
+    // Optional value ordering for eviction. A higher return value means "keep me". Pinned entries
+    // and the caller's protect_id are never selected, regardless of score.
+    using ValueScorer = std::function<double(const ParkedSequence&)>;
+
     ParkedSequenceStore() noexcept = default;
     explicit ParkedSequenceStore(std::uint64_t budget_bytes) noexcept
         : budget_bytes_(budget_bytes) {}
+
+    void set_value_scorer(ValueScorer scorer) { value_scorer_ = std::move(scorer); }
+    void clear_value_scorer() { value_scorer_ = nullptr; }
 
     [[nodiscard]] bool enabled() const noexcept { return budget_bytes_ != 0; }
     [[nodiscard]] std::uint64_t budget_bytes() const noexcept { return budget_bytes_; }
@@ -336,12 +354,17 @@ public:
     void clear() noexcept;
 
 private:
+    // Index of the entry to give up: lowest value density when a scorer is installed, otherwise
+    // least-recently-used. Pinned entries and `protect_id` are skipped. Nullopt when every entry is
+    // excluded.
+    [[nodiscard]] std::optional<std::size_t> select_victim(std::uint64_t protect_id) const noexcept;
     bool evict_least_recently_used(std::uint64_t protect_id) noexcept;
 
     std::vector<std::unique_ptr<ParkedSequence>> entries_;
     std::uint64_t budget_bytes_ = 0;
     std::size_t used_bytes_     = 0;
     std::uint64_t next_id_      = 1;
+    ValueScorer value_scorer_;
 };
 
 inline std::optional<std::uint64_t> ParkedSequenceStore::insert(
@@ -352,7 +375,9 @@ inline std::optional<std::uint64_t> ParkedSequenceStore::insert(
         // room: a refused insert must leave the store exactly as it found it.
         std::size_t protected_bytes = 0;
         for (const std::unique_ptr<ParkedSequence>& stored : entries_) {
-            if (stored->id == protect_id) { protected_bytes += stored->bytes; }
+            if (stored->id == protect_id || stored->pinned) {
+                protected_bytes += stored->bytes;
+            }
         }
         if (protected_bytes + entry->bytes > budget_bytes_) { return std::nullopt; }
         while (used_bytes_ + entry->bytes > budget_bytes_) {
@@ -471,19 +496,45 @@ inline std::optional<ParkedCheckpointMatch> ParkedSequenceStore::match_checkpoin
     return match_parked_checkpoints(entries, prompt);
 }
 
-// Removes and returns the least-recently-used entry so the caller can spill it to disk and index
-// it there. Returns nullptr when the store is empty or every entry is protected (the in-flight
-// restore target). The caller owns the returned payload.
-inline std::unique_ptr<ParkedSequence> ParkedSequenceStore::remove_least_recently_used(
-    std::uint64_t protect_id) {
+inline std::optional<std::size_t>
+ParkedSequenceStore::select_victim(std::uint64_t protect_id) const noexcept {
+    if (value_scorer_) {
+        std::optional<std::size_t> best;
+        double best_density = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            const ParkedSequence& entry = *entries_[i];
+            if (entry.id == protect_id || entry.pinned) { continue; }
+            const double density = value_scorer_(entry);
+            const double score   = std::isfinite(density) ? density : 0.0;
+            if (!best || score < best_density ||
+                (score == best_density &&
+                 entry.last_used < entries_[*best]->last_used)) {
+                best         = i;
+                best_density = score;
+            }
+        }
+        if (best) { return best; }
+        // A scorer that excludes everything must not fall through to LRU: pinned entries are
+        // never evictable.
+        return std::nullopt;
+    }
     std::optional<std::size_t> oldest;
     for (std::size_t i = 0; i < entries_.size(); ++i) {
-        if (entries_[i]->id == protect_id) { continue; }
+        if (entries_[i]->id == protect_id || entries_[i]->pinned) { continue; }
         if (!oldest || entries_[i]->last_used < entries_[*oldest]->last_used) { oldest = i; }
     }
-    if (!oldest) { return nullptr; }
-    std::unique_ptr<ParkedSequence> entry = std::move(entries_[*oldest]);
-    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*oldest));
+    return oldest;
+}
+
+// Removes and returns the least valuable entry so the caller can spill it to disk and index it
+// there. Returns nullptr when the store is empty or every entry is protected (the in-flight restore
+// target). The caller owns the returned payload.
+inline std::unique_ptr<ParkedSequence> ParkedSequenceStore::remove_least_recently_used(
+    std::uint64_t protect_id) {
+    const std::optional<std::size_t> victim = select_victim(protect_id);
+    if (!victim) { return nullptr; }
+    std::unique_ptr<ParkedSequence> entry = std::move(entries_[*victim]);
+    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*victim));
     used_bytes_ -= entry->bytes;
     return entry;
 }
@@ -528,11 +579,7 @@ inline void ParkedSequenceStore::clear() noexcept {
 }
 
 inline bool ParkedSequenceStore::evict_least_recently_used(std::uint64_t protect_id) noexcept {
-    std::optional<std::size_t> victim;
-    for (std::size_t i = 0; i < entries_.size(); ++i) {
-        if (entries_[i]->id == protect_id) { continue; }
-        if (!victim || entries_[i]->last_used < entries_[*victim]->last_used) { victim = i; }
-    }
+    const std::optional<std::size_t> victim = select_victim(protect_id);
     if (!victim) { return false; }
     used_bytes_ -= entries_[*victim]->bytes;
     entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(*victim));

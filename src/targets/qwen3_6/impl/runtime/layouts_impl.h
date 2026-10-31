@@ -849,6 +849,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_park_io_bytes    = inputs.kv_park_io_bytes;
     impl->kv_park_prefetch    = inputs.kv_park_prefetch;
     impl->kv_park_max_age_sec = inputs.kv_park_max_age_sec;
+    impl->kv_park_value_policy = inputs.kv_park_value_policy;
+    impl->kv_park_restore_min_saving_ms = inputs.kv_park_restore_min_saving_ms;
+    impl->kv_park_value_half_life_sec = inputs.kv_park_value_half_life_sec;
+    impl->kv_park_prefill_tok_s = inputs.kv_park_prefill_tok_s;
+    impl->kv_park_read_bytes_per_sec = inputs.kv_park_read_bytes_per_sec;
+    impl->kv_park_restore_overhead_ms = inputs.kv_park_restore_overhead_ms;
+    impl->kv_park_value_sweep_sec = inputs.kv_park_value_sweep_sec;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -1007,6 +1014,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_park_io_bytes = options.kv_park_io_bytes,
         .kv_park_prefetch = options.kv_park_prefetch,
         .kv_park_max_age_sec = options.kv_park_max_age_sec,
+        .kv_park_value_policy = options.kv_park_value_policy,
+        .kv_park_restore_min_saving_ms = options.kv_park_restore_min_saving_ms,
+        .kv_park_value_half_life_sec = options.kv_park_value_half_life_sec,
+        .kv_park_prefill_tok_s = options.kv_park_prefill_tok_s,
+        .kv_park_read_bytes_per_sec = options.kv_park_read_bytes_per_sec,
+        .kv_park_restore_overhead_ms = options.kv_park_restore_overhead_ms,
+        .kv_park_value_sweep_sec = options.kv_park_value_sweep_sec,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

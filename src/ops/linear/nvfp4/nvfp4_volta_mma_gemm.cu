@@ -12,12 +12,19 @@ namespace ninfer::ops::detail {
 
 namespace {
 using S = Nvfp4VoltaMmaSchedule;
-static_assert(S::kRowsPerCta == kVoltaMmaRowsPerCta);
-static_assert(S::kTTile == kVoltaMmaTTile);
 } // namespace
 
+// The same L2-budget reasoning as volta_mma_split_count (see volta_mma_splits.h), re-expressed
+// for this kernel's 64x64 CTA tile. The shared heuristic's 32x32 tile factors would count 4x
+// too many CTAs here and split long-K shapes past the point where the concurrent weight
+// footprint stops fitting in L2.
 int nvfp4_volta_mma_splits(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
-    return volta_mma_split_count(n, k, t);
+    const int row_ctas = (n + S::kRowsPerCta - 1) / S::kRowsPerCta;
+    const int t_tiles  = (t + S::kTTile - 1) / S::kTTile;
+    const int blocks   = row_ctas * t_tiles;
+    int splits         = blocks >= kVoltaMmaCtaBudget ? 1 : kVoltaMmaCtaBudget / blocks;
+    if (k >= kVoltaMmaLongK) { splits = std::min(splits, 2); }
+    return std::max(splits, 1);
 }
 
 std::size_t nvfp4_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,
@@ -48,6 +55,8 @@ void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Works
     const dim3 grid(static_cast<unsigned>((n + S::kRowsPerCta - 1) / S::kRowsPerCta),
                     static_cast<unsigned>(splits),
                     static_cast<unsigned>((t + S::kTTile - 1) / S::kTTile));
+    static_assert(S::kRowsPerCta % S::kNPerWarp == 0);
+    static_assert(S::kTTileWarp == 32);
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const std::uint8_t*>(w.scales);
     auto* out_data      = static_cast<__nv_bfloat16*>(out.data);
